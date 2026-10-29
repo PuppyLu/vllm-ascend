@@ -167,6 +167,26 @@ def test_process_weights_after_loading_uses_version_specific_layout(
     assert layer.w2_weight.weight_loader is w2_parameter.weight_loader
 
 
+def test_mtp_float_draft_keeps_legacy_weights_without_zerc_pack(monkeypatch):
+    from vllm_ascend.zercmoe_config import zercmoe_draft_model_loading
+
+    method = _build_unquantized_method()
+    layer = _build_weight_layer()
+    monkeypatch.setattr(fused_moe_module, "get_ascend_config", lambda: SimpleNamespace(enable_fused_mc2=True))
+    monkeypatch.setattr(fused_moe_module, "get_current_vllm_config", lambda: object())
+    zerc = MagicMock(side_effect=AssertionError("draft must not query Zerc"))
+    monkeypatch.setattr(fused_moe_module, "use_cann_zercmoe", zerc)
+    monkeypatch.setattr(fused_moe_module, "use_cann_megamoe", lambda _: False)
+    monkeypatch.setattr(fused_moe_module.torch_npu, "npu_format_cast", lambda tensor, _: tensor)
+    upstream_method_base = AscendUnquantizedFusedMoEMethod.__mro__[2]
+    monkeypatch.setattr(upstream_method_base, "process_weights_after_loading", lambda self, layer: None, raising=False)
+    with zercmoe_draft_model_loading():
+        method.process_weights_after_loading(layer)
+    zerc.assert_not_called()
+    assert hasattr(layer, "w13_weight") and hasattr(layer, "w2_weight")
+    assert not hasattr(layer, "w13_weight_zr") and not hasattr(layer, "w2_weight_zr")
+
+
 def test_ascend_runner_promotes_runtime_state_to_buffer():
     runner = AscendMoERunner.__new__(AscendMoERunner)
     nn.Module.__init__(runner)

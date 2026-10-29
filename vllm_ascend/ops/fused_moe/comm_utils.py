@@ -15,12 +15,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+import os
+from functools import lru_cache
 from importlib import import_module
 
 import torch
 import torch.distributed
 import torch.distributed as dist
 import torch_npu
+from vllm.logger import logger
 
 from vllm_ascend.quantization.quant_type import QuantType
 
@@ -118,6 +121,93 @@ def load_cann_mega_moe_ops():
     get_symm_buffer_for_mega_moe = ops_module.get_symm_buffer_for_mega_moe
     mega_moe = ops_module.mega_moe
     return get_symm_buffer_for_mega_moe, mega_moe
+
+
+def bind_zercmoe_ep_environment(ep_rank=None, ep_world_size=None):
+    """Populate missing SHMEM identity; never overwrite another rank domain."""
+    if ep_rank is None or ep_world_size is None:
+        # Workers have initialized their groups before loading expert weights.
+        from vllm_ascend.distributed.parallel_state import get_mc2_group
+
+        group = get_mc2_group()
+        ep_rank, ep_world_size = group.rank_in_group, group.world_size
+    if ep_world_size <= 1 or not 0 <= ep_rank < ep_world_size:
+        raise ValueError(f"Invalid ZercMoE EP identity: rank={ep_rank}, world_size={ep_world_size}.")
+    expected_environment = {"RANK": ep_rank, "WORLD_SIZE": ep_world_size}
+    for name, expected in expected_environment.items():
+        value = os.environ.get(name)
+        if value is not None:
+            try:
+                matches = int(value) == expected
+            except ValueError:
+                matches = False
+            if not matches:
+                raise ValueError(
+                    f"ZercMoE {name}={value!r} must match the actual EP group value {expected}. "
+                    "The 1.5 wheel reads its rank from the process environment; fix worker launch identity."
+                )
+    for name, expected in expected_environment.items():
+        os.environ.setdefault(name, str(expected))
+
+
+def load_a3_zercmoe_ops():
+    """Load the installed ZercMoE package after checking the worker's EP identity."""
+    from vllm_ascend.ops.fused_moe.zercmoe_adapter import validate_w8a8_backend
+
+    bind_zercmoe_ep_environment()
+    try:
+        ops_module = import_module("zercmoe")
+        return validate_w8a8_backend(ops_module)
+    except (ImportError, AttributeError, RuntimeError, OSError) as exc:
+        raise RuntimeError(f"Requested A3 ZERC_MOE backend is unavailable: {exc}") from exc
+
+
+@lru_cache(maxsize=1)
+def a3_zercmoe_lib_available() -> bool:
+    """An explicitly enabled A3 backend must fail rather than silently fall back."""
+    try:
+        load_a3_zercmoe_ops()
+    except (ImportError, AttributeError, RuntimeError, OSError) as exc:
+        raise RuntimeError(f"Requested A3 ZERC_MOE backend is unavailable: {exc}") from exc
+    return True
+
+
+_ZERCMOE_AVAILABLE: bool | None = None
+
+
+def zercmoe_lib_available() -> bool:
+    """Whether the ZercMoE wheel (dispatch_gmm_combine_zero_redundant host
+    bindings) is importable.
+
+    Importing zercmoe loads its bundled .so libraries (libshmem etc.), so the
+    check is lazy and cached: it must stay out of unrelated configs and must
+    not run repeatedly.
+    """
+    global _ZERCMOE_AVAILABLE
+    if _ZERCMOE_AVAILABLE is None:
+        try:
+            import zercmoe  # noqa: F401
+        except Exception as e:
+            logger.warning_once("zercmoe wheel is not available, ZERC_MOE branch disabled: %s", e)
+            _ZERCMOE_AVAILABLE = False
+        else:
+            _ZERCMOE_AVAILABLE = True
+    return _ZERCMOE_AVAILABLE
+
+
+def load_zercmoe_ops():
+    """Import the zercmoe wheel and return its module.
+
+    The module exposes:
+      - ``mega_moe(x, topk_ids, topk_weights, l1_weights, l2_weights,
+        sym_buffer, **kw)``: fused Dispatch-GMM1-SwiGLU-GMM2-Combine pipeline,
+        returns ``(output, expert_token_nums)``;
+      - ``pack_weights(w1_nd, w2_nd)``: packs ND per-expert weights
+        ([E, k, 2*inter] / [E, inter, k] bf16) into the operator's zN flat
+        layout;
+      - ``get_symm_buffer(...)``: SHMEM symmetric-heap comm-domain handle.
+    """
+    return import_module("zercmoe")
 
 
 def _get_cann_mega_moe_quant_settings(quant_type: QuantType) -> tuple[int, int | None, int | None]:

@@ -53,6 +53,64 @@ def is_megamoe_supported_by_config(vllm_config) -> bool:
     return moe_intermediate_size >= 1024 and moe_intermediate_size <= 3072 and moe_intermediate_size % 512 == 0
 
 
+def is_zercmoe_supported_by_config(vllm_config) -> bool:
+    """Model-shape constraints for the ZercMoE kernel (zN weight packing).
+
+    The ZercMoE operator (dispatch_gmm_combine_zero_redundant) packs per-expert
+    weights into catlass zN layout ((cols//16, rows, 16) physical order) via
+    ``zercmoe.pack_weights``, which requires:
+      - hidden_size (GEMM1 K / GEMM2 N) multiple of 16;
+      - moe_intermediate_size multiple of 16: GEMM1 N = 2*intermediate and the
+        zN column-block stride of w2 (GEMM2 K) both derive from it; a
+        non-multiple causes misaddressing that the op's numel checks cannot
+        catch.
+    Bounds follow the MegaMoe-validated range, with the %512 cube-step
+    alignment relaxed to %16 (a ZercMoE-specific advantage). Under EP the moe
+    tp_size is 1 (each rank owns whole experts), so the per-partition
+    intermediate equals the global HF value.
+    """
+    hf_text_config = vllm_config.model_config.hf_text_config
+    hidden_size = getattr(hf_text_config, "hidden_size", None)
+    if hidden_size is None and hasattr(vllm_config.model_config, "get_hidden_size"):
+        hidden_size = vllm_config.model_config.get_hidden_size()
+    if hidden_size is None:
+        return False
+    hidden_size = int(hidden_size)
+    if hidden_size < 1024 or hidden_size > 8192 or hidden_size % 16 != 0:
+        return False
+
+    moe_intermediate_size = getattr(hf_text_config, "moe_intermediate_size", None)
+    if moe_intermediate_size is None:
+        return False
+    moe_intermediate_size = int(moe_intermediate_size)
+    return 512 <= moe_intermediate_size <= 3072 and moe_intermediate_size % 16 == 0
+
+
+def is_zercmoe_a3_supported_by_config(vllm_config) -> bool:
+    """Model dimensions documented for the internal 1.5 W8A8 wheel."""
+    from vllm_ascend.zercmoe_config import ZERCMOE_ALIGNMENT
+
+    model_config = vllm_config.model_config
+    hf_config = model_config.hf_text_config
+    hidden = getattr(hf_config, "hidden_size", None)
+    if hidden is None and hasattr(model_config, "get_hidden_size"):
+        hidden = model_config.get_hidden_size()
+    intermediate = getattr(hf_config, "moe_intermediate_size", None)
+    experts = getattr(hf_config, "n_routed_experts", None)
+    if experts is None and hasattr(model_config, "get_num_experts"):
+        experts = model_config.get_num_experts()
+    if hidden is None or intermediate is None or experts is None:
+        return False
+    hidden, intermediate, experts = int(hidden), int(intermediate), int(experts)
+    return (
+        hidden > 0
+        and intermediate > 0
+        and hidden % ZERCMOE_ALIGNMENT == 0
+        and intermediate % ZERCMOE_ALIGNMENT == 0
+        and experts > 0
+    )
+
+
 class AscendConfig:
     """
     Configuration Object for additional_config from vllm.configs.
@@ -183,6 +241,50 @@ class AscendConfig:
             ascend_envs.VLLM_ASCEND_ENABLE_FUSED_MC2,
         )
         assert self.enable_fused_mc2 in (0, 1), f"enable_fused_mc2 must be 0 or 1, got {self.enable_fused_mc2}"
+
+        # A3's internal 1.5 wheel is independent of enable_fused_mc2 and may
+        # serve eager prefill, decode and mixed batches in any P/D role.
+        # Graph/draft batches retain their configured backend. A2 is separate.
+        self.enable_zerc_moe = self._get_config_value(
+            additional_config,
+            "enable_zerc_moe",
+            "VLLM_ASCEND_ENABLE_ZERC_MOE",
+            ascend_envs.VLLM_ASCEND_ENABLE_ZERC_MOE,
+        )
+        assert self.enable_zerc_moe in (0, 1), f"enable_zerc_moe must be 0 or 1, got {self.enable_zerc_moe}"
+
+        if "zercmoe_single_weight" in additional_config:
+            raise ValueError("zercmoe_single_weight has been removed; delete it from additional_config.")
+
+        self.zercmoe_single_weight = False
+        if self.enable_zerc_moe == 1:
+            from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+            self.zercmoe_single_weight = get_ascend_device_type() == AscendDeviceType.A3
+
+        # SHMEM bootstrap address for ZercMoE, e.g. "tcp://<master_ip>:28765".
+        # Must be identical across all ranks of one EP group and unique across
+        # groups/jobs. None -> auto "tcp://127.0.0.1:28765" (single node).
+        # Multi-node deployments MUST set the master address explicitly.
+        self.zercmoe_ipport = additional_config.get("zercmoe_ipport", None)
+        if self.zercmoe_ipport is not None and not isinstance(self.zercmoe_ipport, str):
+            raise ValueError(
+                f"zercmoe_ipport must be a string like 'tcp://IP:PORT', got {type(self.zercmoe_ipport).__name__}"
+            )
+
+        # SHMEM symmetric heap size (MB per rank). None -> the
+        # zercmoe SymmBuffer auto-estimate is used (see the wheel docs).
+        self.zercmoe_shmem_mb = additional_config.get("zercmoe_shmem_mb", None)
+        if self.zercmoe_shmem_mb is not None:
+            if not isinstance(self.zercmoe_shmem_mb, int) or isinstance(self.zercmoe_shmem_mb, bool):
+                raise ValueError(f"zercmoe_shmem_mb must be an integer, got {type(self.zercmoe_shmem_mb).__name__}")
+            if self.zercmoe_shmem_mb < 0:
+                raise ValueError(f"zercmoe_shmem_mb must be zero (automatic) or positive, got {self.zercmoe_shmem_mb}")
+
+        # This belongs to the retired hand-written KFC ABI. The internal
+        # wheel derives capacity from its SHMEM heap and source token limit.
+        self.zercmoe_max_recv_token_num = additional_config.get("zercmoe_max_recv_token_num", None)
+
         model_architectures = getattr(vllm_config.model_config, "architectures", None) or []
         assert not (
             self.enable_fused_mc2 == 1
@@ -192,16 +294,39 @@ class AscendConfig:
             "additional_config.enable_fused_mc2 to 0 or unset VLLM_ASCEND_ENABLE_FUSED_MC2."
         )
         if self.enable_fused_mc2 == 1 and self.multistream_overlap_shared_expert:
-            self.multistream_overlap_shared_expert = False
-            logger.warning_once(
-                "VLLM_ASCEND_ENABLE_FUSED_MC2 (fused mc2) and multistream_overlap_shared_expert "
-                "cannot be enabled at the same time. Setting multistream_overlap_shared_expert to False."
-            )
-        if (
+            from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+            from vllm_ascend.zercmoe_config import allow_zercmoe_shared_expert_overlap
+
+            if not allow_zercmoe_shared_expert_overlap(
+                enabled=self.enable_zerc_moe,
+                single_weight=self.zercmoe_single_weight,
+                is_a3=get_ascend_device_type() == AscendDeviceType.A3,
+            ):
+                self.multistream_overlap_shared_expert = False
+                logger.warning_once(
+                    "VLLM_ASCEND_ENABLE_FUSED_MC2 (fused mc2) and multistream_overlap_shared_expert "
+                    "cannot be enabled at the same time. Setting multistream_overlap_shared_expert to False."
+                )
+        # Only the legacy A2 path depends on the fused-MC2 switch. A3 Zerc
+        # is independent: enabling it must not change fallback eligibility.
+        _megamoe_unsupported = bool(
             self.enable_fused_mc2 == 1
             and _CANN_OPS_TRANSFORMER_AVAILABLE
             and not is_megamoe_supported_by_config(vllm_config)
-        ):
+        )
+        _zercmoe_exemption = False
+        if _megamoe_unsupported and self.enable_zerc_moe == 1:
+            import torch
+
+            from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+            _zercmoe_exemption = (
+                get_ascend_device_type() == AscendDeviceType.A2
+                and vllm_config.model_config.dtype == torch.bfloat16
+                and vllm_config.model_config.is_quantized is False
+                and is_zercmoe_supported_by_config(vllm_config)
+            )
+        if _megamoe_unsupported and not _zercmoe_exemption:
             self.enable_fused_mc2 = 0
             logger.warning_once(
                 "MegaMoe is not supported for this model config, VLLM_ASCEND_ENABLE_FUSED_MC2 will be set to 0."

@@ -108,7 +108,7 @@ class MoETokenDispatcher(ABC, Generic[TMoECombineMetadata]):
 
 
 class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
-    def __init__(self, **kwargs):
+    def __init__(self, *, token_capacity: int | None = None, **kwargs):
         super().__init__(**kwargs)
         device_group = get_mc2_group().device_group
         # TODO: Try local_rank = ep_group.rank_in_group
@@ -129,9 +129,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         # dispatch & combine operators with different input num_tokens per rank.
         vllm_config = get_current_vllm_config()
         tp_size = vllm_config.parallel_config.tensor_parallel_size
-        mc2_tokens_capacity = get_mc2_tokens_capacity()
-        if not kwargs.get("is_fused_mc2", False):
-            mc2_tokens_capacity = get_dispatch_v2_tokens_capacity() or mc2_tokens_capacity
+        mc2_tokens_capacity = token_capacity
+        if mc2_tokens_capacity is None:
+            mc2_tokens_capacity = get_mc2_tokens_capacity()
+            if not kwargs.get("is_fused_mc2", False):
+                mc2_tokens_capacity = get_dispatch_v2_tokens_capacity() or mc2_tokens_capacity
         num_tokens_per_tp_rank = mc2_tokens_capacity // tp_size
         # Surface the per-rank capacity for CANN MegaMoe's get_symm_buffer
         # sizing (used by FusedMC2CommImpl._get_cann_symm_buffer). Without

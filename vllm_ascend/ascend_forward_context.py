@@ -11,8 +11,15 @@ from vllm.distributed import get_dp_group, get_ep_group, get_tensor_model_parall
 from vllm.forward_context import BatchDescriptor, get_forward_context, set_forward_context
 from vllm.logger import logger
 
-from vllm_ascend.ascend_config import _CANN_OPS_TRANSFORMER_AVAILABLE, get_ascend_config, is_megamoe_supported_by_config
+from vllm_ascend.ascend_config import (
+    _CANN_OPS_TRANSFORMER_AVAILABLE,
+    get_ascend_config,
+    is_megamoe_supported_by_config,
+    is_zercmoe_a3_supported_by_config,
+    is_zercmoe_supported_by_config,
+)
 from vllm_ascend.utils import (
+    ASCEND_QUANTIZATION_METHOD,
     AscendDeviceType,
     enable_sp,
     get_ascend_device_type,
@@ -27,15 +34,18 @@ class MoECommType(Enum):
     MC2 = 1
     ALLTOALL = 2
     FUSED_MC2 = 3
+    ZERC_MOE = 4
 
 
 _MRV2_IN_PROFILE_RUN: ContextVar[bool] = ContextVar("_MRV2_IN_PROFILE_RUN", default=False)
 _MEGA_MOE_TOKENS_PER_RANK_LIMIT = 4096
 _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT = 512
 _MC2_TOKENS_PER_RANK_LIMIT = 512
+_A2_ZERCMOE_MIN_PREFILL_TOKENS = 64
 
 
-def _is_decode_only_node(vllm_config: VllmConfig) -> bool:
+def _is_pd_consumer(vllm_config: VllmConfig) -> bool:
+    """Identify the D role independently of whether it can recompute prefill."""
     kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
     if kv_transfer_config is None:
         return False
@@ -50,7 +60,11 @@ def _is_decode_only_node(vllm_config: VllmConfig) -> bool:
             and not getattr(kv_transfer_config, "is_kv_producer", False)
         )
     )
-    if not (is_decode_bench or is_kv_consumer):
+    return is_decode_bench or is_kv_consumer
+
+
+def _is_decode_only_node(vllm_config: VllmConfig) -> bool:
+    if not _is_pd_consumer(vllm_config):
         return False
 
     scheduler_config = getattr(get_ascend_config(), "scheduler_config", None)
@@ -82,7 +96,7 @@ def get_mrv2_in_profile_run() -> bool:
 
 
 def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
-    # Disable MegaMoE pending related bug fixes
+    # Disable MegaMoe pending related bug fixes
     return False
     # TODO: drop the EP-size guard when MegaMoe supports larger EP sizes.
     return (
@@ -94,6 +108,219 @@ def use_cann_megamoe(vllm_config: VllmConfig) -> bool:
         and 1 < get_ep_group().world_size <= 64
         and getattr(vllm_config, "lora_config", None) is None
         and is_megamoe_supported_by_config(vllm_config)
+    )
+
+
+def is_zercmoe_active_by_config(vllm_config: VllmConfig) -> bool:
+    """Config-level ZercMoE gate without group access or backend imports.
+
+    Safe to call from early platform hooks (cudagraph demotion) in the
+    scheduler / engine-core processes. ``use_cann_zercmoe`` checks the fixed
+    internal A3 W8A8 wheel or the A2 backend inside workers. A requested A3
+    wheel must validate before the first forward, rather than fall back.
+    """
+    parallel_config = vllm_config.parallel_config
+    model_config = vllm_config.model_config
+    if get_ascend_device_type() == AscendDeviceType.A3:
+        return (
+            should_prepare_zercmoe_w8a8_weights(vllm_config)
+            and parallel_config.pipeline_parallel_size == 1
+            and getattr(parallel_config, "prefill_context_parallel_size", 1) == 1
+        )
+    return (
+        not _is_pd_consumer(vllm_config)
+        and get_ascend_config().enable_zerc_moe == 1
+        and get_ascend_config().enable_fused_mc2 == 1
+        and get_ascend_device_type() == AscendDeviceType.A2
+        and is_moe_model(vllm_config)
+        and parallel_config.enable_expert_parallel
+        and parallel_config.pipeline_parallel_size == 1
+        and parallel_config.data_parallel_size == 1
+        and 1 < parallel_config.tensor_parallel_size <= 64
+        and model_config.dtype == torch.bfloat16
+        and model_config.is_quantized is False
+        and is_zercmoe_supported_by_config(vllm_config)
+    )
+
+
+def should_prepare_zercmoe_w8a8_weights(vllm_config: VllmConfig) -> bool:
+    """Opt-in A3 weight preparation, independent of runtime eligibility.
+
+    This does not import either backend or inspect distributed groups. P, D
+    and colocated workers prepare the same weights. The caller must check the
+    actual scheme: a model-level quantization flag alone does not identify W8A8.
+    """
+    ascend_config = get_ascend_config()
+    eligible = (
+        ascend_config.enable_zerc_moe == 1
+        and get_ascend_device_type() == AscendDeviceType.A3
+        # ModelSlim may be selected explicitly even when the HF config has no
+        # quantization_config. The actual MoE scheme is validated after load.
+        and (
+            vllm_config.model_config.is_quantized
+            or getattr(vllm_config.model_config, "quantization", None) == ASCEND_QUANTIZATION_METHOD
+        )
+        and vllm_config.model_config.dtype == torch.bfloat16
+        and is_zercmoe_a3_supported_by_config(vllm_config)
+        and is_moe_model(vllm_config)
+        and vllm_config.parallel_config.enable_expert_parallel
+        and getattr(vllm_config, "lora_config", None) is None
+        and not ascend_config.eplb_config.dynamic_eplb
+    )
+    if eligible:
+        from vllm_ascend.zercmoe_config import ZERCMOE_MIN_SHMEM_MB
+
+        if getattr(ascend_config, "mix_placement", False):
+            raise ValueError("ZercMoE requires independent shared experts; mix_placement is unsupported.")
+        if getattr(ascend_config, "zercmoe_max_recv_token_num", None) is not None:
+            raise ValueError(
+                "zercmoe_max_recv_token_num is unsupported by zercmoe 1.5; remove it and use zercmoe_shmem_mb."
+            )
+        heap_mb = getattr(ascend_config, "zercmoe_shmem_mb", None)
+        if heap_mb and heap_mb < ZERCMOE_MIN_SHMEM_MB:
+            raise ValueError(
+                f"A3 ZercMoE requires zercmoe_shmem_mb=0/None or at least {ZERCMOE_MIN_SHMEM_MB} MB per rank. "
+                "The explicit minimum is a framework guard, not a guarantee that the heap is sufficient. "
+                "Automatic sizing is determined by the wheel."
+            )
+    return eligible
+
+
+def get_zercmoe_tokens_capacity(vllm_config: VllmConfig) -> int:
+    """Size A3's shared heap from the scheduling budget, independently of MC2."""
+    budget = vllm_config.scheduler_config.max_num_batched_tokens
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+    if budget <= 0 or tp_size <= 0:
+        raise ValueError("ZercMoE requires a positive token budget and TP size.")
+    return (budget + tp_size - 1) // tp_size * tp_size
+
+
+def get_zercmoe_cudagraph_mode(vllm_config: VllmConfig) -> CUDAGraphMode:
+    """Keep A3 graph configuration unchanged; only its eager batches use Zerc."""
+    mode = vllm_config.compilation_config.cudagraph_mode
+    if get_ascend_device_type() != AscendDeviceType.A2 or vllm_config.model_config.enforce_eager:
+        return mode
+    if mode == CUDAGraphMode.FULL and is_zercmoe_active_by_config(vllm_config):
+        return CUDAGraphMode.FULL_DECODE_ONLY
+    return mode
+
+
+def use_cann_zercmoe(vllm_config: VllmConfig) -> bool:
+    """Worker-only backend check for the A3 1.5 W8A8 or A2 BF16 wheel."""
+    if not is_zercmoe_active_by_config(vllm_config):
+        return False
+    from vllm_ascend.ops.fused_moe.comm_utils import a3_zercmoe_lib_available, zercmoe_lib_available
+
+    is_a3 = get_ascend_device_type() == AscendDeviceType.A3
+    world = get_ep_group().world_size
+    if world <= 1 or (not is_a3 and world > 64):
+        return False
+    if is_a3 and vllm_config.model_config.get_num_experts() % world:
+        return False
+    return (
+        getattr(vllm_config, "lora_config", None) is None
+        and (is_a3 or not enable_sp(vllm_config))
+        and not get_ascend_config().eplb_config.dynamic_eplb
+        and (a3_zercmoe_lib_available() if is_a3 else zercmoe_lib_available())
+    )
+
+
+def validate_zercmoe_single_weight_config(vllm_config: VllmConfig) -> None:
+    """Reject unsupported modes before loading a model without fallback weights."""
+    ascend_config = get_ascend_config()
+    if getattr(ascend_config, "zercmoe_single_weight", False) is not True:
+        return
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+    if get_ascend_device_type() != AscendDeviceType.A3 or not is_zercmoe_active_by_config(vllm_config):
+        raise ValueError("A3 ZercMoE single-weight requires an eligible A3 BF16 W8A8 MoE with EP, PP=PCP=1.")
+    if not getattr(model_config, "enforce_eager", False) and (
+        getattr(vllm_config.compilation_config, "cudagraph_mode", None) != CUDAGraphMode.FULL_DECODE_ONLY
+    ):
+        raise ValueError("A3 ZercMoE single-weight requires eager or FULL_DECODE_ONLY graph mode.")
+    if not getattr(model_config, "enforce_eager", False) and (
+        getattr(parallel_config, "use_ubatching", False) or getattr(parallel_config, "enable_dbo", False)
+    ):
+        raise ValueError("A3 ZercMoE single-weight decode graph does not support microbatching.")
+    if getattr(parallel_config, "decode_context_parallel_size", 1) != 1:
+        raise ValueError("A3 ZercMoE single-weight does not support decode context parallelism.")
+    speculative = getattr(vllm_config, "speculative_config", None)
+    if speculative is not None:
+        hf_config = getattr(model_config, "hf_config", None)
+        if getattr(speculative, "method", None) != "mtp" or getattr(hf_config, "model_type", None) != "glm_moe_dsa":
+            raise ValueError("A3 ZercMoE single-weight currently supports speculative decoding only for GLM MTP.")
+        if getattr(speculative, "draft_tensor_parallel_size", None) != getattr(
+            parallel_config, "tensor_parallel_size", None
+        ):
+            raise ValueError("A3 ZercMoE single-weight requires MTP draft TP to match the main model TP.")
+    if getattr(model_config, "enable_sleep_mode", False):
+        raise ValueError("A3 ZercMoE single-weight does not support sleep mode.")
+    if getattr(vllm_config, "weight_transfer_config", None) is not None:
+        raise ValueError("A3 ZercMoE single-weight does not support weight transfer or reload.")
+    if getattr(getattr(ascend_config, "xlite_graph_config", None), "enabled", False):
+        raise ValueError("A3 ZercMoE single-weight does not support XLite.")
+    if getattr(vllm_config, "use_v2_model_runner", False):
+        raise ValueError("A3 ZercMoE single-weight currently requires model runner V1.")
+    offload = getattr(vllm_config, "offload_config", None)
+    if (
+        getattr(getattr(offload, "uva", None), "cpu_offload_gb", 0) > 0
+        or getattr(getattr(offload, "prefetch", None), "offload_group_size", 0) > 0
+        or getattr(offload, "offload_backend", None) == "prefetch"
+    ):
+        raise ValueError("A3 ZercMoE single-weight does not support CPU weight offloading.")
+    if not use_cann_zercmoe(vllm_config):
+        raise ValueError("A3 ZercMoE single-weight requires a usable Zerc backend and an evenly partitioned EP group.")
+
+
+def _use_zercmoe_for_batch(
+    num_tokens: int | None,
+    vllm_config: VllmConfig,
+    mc2_tokens_capacity: int,
+    *,
+    is_decode: bool,
+    is_draft_model: bool,
+    is_graph_mode: bool,
+) -> bool:
+    """A3 uses the same mathematical interface for prefill, decode and mixed batches.
+
+    Use synchronized DP sizes for collective agreement, never a local phase
+    or a token-count heuristic. Draft execution retains the original backend.
+    A2 retains its separate legacy policy.
+    """
+    if get_ascend_device_type() == AscendDeviceType.A3:
+        return (
+            not is_draft_model
+            and (
+                not is_graph_mode
+                or (
+                    is_decode
+                    and getattr(vllm_config.compilation_config, "cudagraph_mode", None)
+                    == CUDAGraphMode.FULL_DECODE_ONLY
+                )
+            )
+            and use_cann_zercmoe(vllm_config)
+            and (num_tokens is None or 0 <= num_tokens <= get_zercmoe_tokens_capacity(vllm_config))
+        )
+    return (
+        not is_decode
+        and not is_draft_model
+        and not is_graph_mode
+        and not _is_pd_consumer(vllm_config)
+        and (num_tokens is None or num_tokens > _A2_ZERCMOE_MIN_PREFILL_TOKENS)
+        and (num_tokens is None or num_tokens <= mc2_tokens_capacity)
+        and use_cann_zercmoe(vllm_config)
+    )
+
+
+def is_zercmoe_decode_graph(vllm_config, runtime_mode, batch_descriptor, *, is_draft_model: bool) -> bool:
+    """Identify a full uniform-decode capture, including MTP verification."""
+    return (
+        runtime_mode == CUDAGraphMode.FULL
+        and getattr(vllm_config.compilation_config, "cudagraph_mode", None) == CUDAGraphMode.FULL_DECODE_ONLY
+        and bool(getattr(batch_descriptor, "uniform", False))
+        and not is_draft_model
+        and not getattr(vllm_config.parallel_config, "use_ubatching", False)
+        and not getattr(vllm_config.parallel_config, "enable_dbo", False)
     )
 
 
@@ -115,6 +342,7 @@ def set_ascend_forward_context(
     has_sinks=False,
     input_ids=None,
     eplb_heat_collection_status: bool = False,
+    request_forward: bool = False,
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -137,16 +365,36 @@ def set_ascend_forward_context(
 
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
 
-        max_num_tokens = int(num_tokens_across_dp.max().item()) if num_tokens_across_dp is not None else num_tokens
+        # Use the same synchronized CPU metadata for both backend selection
+        # and padding. A rank with no local tokens must choose the same backend.
+        dp_meta = forward_context.dp_metadata
+        if dp_meta is not None:
+            max_num_tokens = int(dp_meta.num_tokens_across_dp_cpu.max().item())
+        else:
+            max_num_tokens = int(num_tokens_across_dp.max().item()) if num_tokens_across_dp is not None else num_tokens
+        # Pass graph execution separately: eager execution does not imply
+        # prefill, notably on PD consumers and MTP draft forwards.
+        is_decode_graph = is_zercmoe_decode_graph(
+            vllm_config, aclgraph_runtime_mode, batch_descriptor, is_draft_model=is_draft_model
+        )
         moe_comm_type = select_moe_comm_method(
             max_num_tokens,
             vllm_config,
             is_draft_model=is_draft_model,
+            is_graph_mode=aclgraph_runtime_mode != CUDAGraphMode.NONE,
+            is_decode=is_decode_graph,
         )
 
         forward_context.moe_comm_type = moe_comm_type
-        forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
+        forward_context.zercmoe_graph_execution = is_decode_graph and moe_comm_type == MoECommType.ZERC_MOE
+        if is_draft_model and getattr(get_ascend_config(), "zercmoe_single_weight", False) is True:
+            forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type, is_draft_model=True)
+            if moe_comm_type is not None and forward_context.moe_comm_method is None:
+                raise RuntimeError("A3 ZercMoE single-weight draft MoE communication was not initialized.")
+        else:
+            forward_context.moe_comm_method = get_moe_comm_method(moe_comm_type)
         forward_context.use_mega_moe = use_cann_megamoe(vllm_config)
+        forward_context.use_zerc_moe = use_cann_zercmoe(vllm_config)
         forward_context.is_decode_only_node = _is_decode_only_node(vllm_config)
 
         tp_world_size = get_tensor_model_parallel_world_size()
@@ -211,23 +459,29 @@ def set_ascend_forward_context(
         dp_world_size = get_dp_group().world_size
         if dp_world_size > 1 and forward_context.dp_metadata is not None:
             dp_meta = forward_context.dp_metadata
-            max_tokens_across_dp = dp_meta.num_tokens_across_dp_cpu.max().item()
+            max_tokens_across_dp = max_num_tokens
             if forward_context.flash_comm_v1_enabled:
                 padded_length = (max_tokens_across_dp + tp_world_size - 1) // tp_world_size * tp_world_size
                 pad_size = padded_length - num_tokens
                 forward_context.padded_length = padded_length
                 forward_context.pad_size = pad_size
         else:
-            max_tokens_across_dp = num_tokens
+            max_tokens_across_dp = max_num_tokens
 
         forward_context.max_tokens_across_dp = max_tokens_across_dp
         forward_context.max_tokens_across_pcp = max_tokens_across_pcp
 
         forward_context.eplb_heat_collection_status = eplb_heat_collection_status
+        # Set only by the request execution entry point, never by dummy runs.
+        forward_context.request_forward = request_forward
+        if request_forward and forward_context.zercmoe_graph_execution:
+            forward_context.moe_comm_method.log_request_graph_selection(max_num_tokens)
 
+        forward_context.mc2_num_actual_tokens = None
         if num_tokens is not None:
             if num_actual_tokens is None:
                 num_actual_tokens = num_tokens
+            forward_context.mc2_num_actual_tokens = num_actual_tokens
             # NOTE: token num which need to pad to when mc2
             forward_context.padded_num_tokens = math.ceil(max_tokens_across_dp / tp_world_size) * tp_world_size
             reserved_mc2_mask = get_mc2_mask()
@@ -236,6 +490,22 @@ def set_ascend_forward_context(
                 mc2_mask[:num_actual_tokens] = True
                 mc2_mask[num_actual_tokens:] = False
                 forward_context.mc2_mask = mc2_mask
+        if (
+            request_forward
+            and not in_profile_run
+            and not is_draft_model
+            and get_ascend_device_type() == AscendDeviceType.A3
+            and get_ascend_config().enable_zerc_moe == 1
+            and moe_comm_type != MoECommType.ZERC_MOE
+        ):
+            zerc_comm = get_moe_comm_method(MoECommType.ZERC_MOE)
+            if zerc_comm is not None:
+                zerc_comm.log_request_fallback(
+                    moe_comm_type,
+                    graph=aclgraph_runtime_mode != CUDAGraphMode.NONE,
+                    num_tokens=max_num_tokens,
+                    capacity=get_zercmoe_tokens_capacity(vllm_config),
+                )
         try:
             yield
         finally:
@@ -257,9 +527,12 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
 
     ascend_config = get_ascend_config()
     use_mega_moe = use_cann_megamoe(vllm_config)
+    # A3 Zerc has an independent scheduler-sized heap. Enabling it must not
+    # change the baseline MC2 dispatch budget used by graph/draft fallbacks.
+    use_zerc_moe = get_ascend_device_type() == AscendDeviceType.A2 and use_cann_zercmoe(vllm_config)
     is_decode_only_node = _is_decode_only_node(vllm_config)
 
-    if ascend_config.enable_prefill_mc2 or (use_mega_moe and not is_decode_only_node):
+    if ascend_config.enable_prefill_mc2 or ((use_mega_moe or use_zerc_moe) and not is_decode_only_node):
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
     elif vllm_config.compilation_config.cudagraph_capture_sizes:
         max_num_tokens = vllm_config.compilation_config.max_cudagraph_capture_size
@@ -271,7 +544,7 @@ def set_mc2_tokens_capacity(vllm_config, max_num_reqs, uniform_decode_query_len)
     num_tokens_per_tp_rank = (max_num_tokens + tp_size - 1) // tp_size
     # keep the num_tokens_per_tp_rank less than fused_mc2 (mega_moe) tokens per rank limit
     if ascend_config.enable_fused_mc2:
-        if use_mega_moe:
+        if use_mega_moe or use_zerc_moe:
             num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _MEGA_MOE_TOKENS_PER_RANK_LIMIT)
         else:
             num_tokens_per_tp_rank = min(num_tokens_per_tp_rank, _DISPATCH_FFN_COMBINE_TOKENS_PER_RANK_LIMIT)
@@ -308,9 +581,10 @@ def set_mc2_mask(vllm_config, device):
     if _reserved_mc2_mask is not None:
         return
     if is_moe_model(vllm_config):
-        _reserved_mc2_mask = torch.zeros(
-            vllm_config.scheduler_config.max_num_batched_tokens, dtype=torch.bool, device=device
-        )
+        tp_size = vllm_config.parallel_config.tensor_parallel_size
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        padded_max_tokens = (max_tokens + tp_size - 1) // tp_size * tp_size
+        _reserved_mc2_mask = torch.zeros(padded_max_tokens, dtype=torch.bool, device=device)
     else:
         _reserved_mc2_mask = None
 
@@ -323,12 +597,24 @@ def _select_a2_moe_comm_method(
     num_tokens: int,
     vllm_config: VllmConfig,
     mc2_tokens_capacity: int,
+    is_decode: bool = False,
+    is_draft_model: bool = False,
+    is_graph_mode: bool = False,
 ) -> MoECommType:
     num_experts = vllm_config.model_config.get_num_experts()
     ep_world_size = (
         vllm_config.parallel_config.world_size_across_dp // vllm_config.parallel_config.pipeline_parallel_size
     )
     num_experts_per_device = num_experts // ep_world_size
+    if _use_zercmoe_for_batch(
+        num_tokens,
+        vllm_config,
+        mc2_tokens_capacity,
+        is_decode=is_decode,
+        is_draft_model=is_draft_model,
+        is_graph_mode=is_graph_mode,
+    ):
+        return MoECommType.ZERC_MOE
     if num_experts > 512:
         return MoECommType.ALLGATHER
     if (
@@ -414,7 +700,19 @@ def _select_a3_moe_comm_method(
     mc2_tokens_capacity: int,
     vllm_config: VllmConfig,
     is_draft_model: bool = False,
+    is_decode: bool = False,
+    is_graph_mode: bool = False,
 ) -> MoECommType:
+    if _use_zercmoe_for_batch(
+        num_tokens,
+        vllm_config,
+        mc2_tokens_capacity,
+        is_decode=is_decode,
+        is_draft_model=is_draft_model,
+        is_graph_mode=is_graph_mode,
+    ):
+        return MoECommType.ZERC_MOE
+
     skip_fused_mc2 = is_draft_model and _moe_quant_mismatch
     if not skip_fused_mc2 and use_cann_megamoe(vllm_config):
         return MoECommType.FUSED_MC2
@@ -450,17 +748,21 @@ def select_moe_comm_method(
     num_tokens: int,
     vllm_config: VllmConfig,
     is_draft_model: bool = False,
+    is_decode: bool = False,
+    is_graph_mode: bool = False,
 ) -> MoECommType | None:
     """Select the MoE communication method according to parallel settings,
     device generation, and token count.
 
     1. Non-MoE models return `None`.
     2. Without expert parallel, fall back to all-gather.
-    3. On A2 with expert parallel, pick MC2 when tokens fit the MC2 capacity
-       and the DP size is large enough; otherwise use all-gather.
-    4. On A3 with expert parallel, prefer fused MC2 when enabled and the EP
-       group size is small enough; otherwise use MC2 within capacity or
-       all-to-all.
+    3. On A2 with expert parallel, ZERC_MOE takes priority for bf16 models on
+       eager prefill-shaped batches within capacity; otherwise pick MC2 when
+       tokens fit the MC2 capacity and the DP size is large enough, or
+       all-gather.
+    4. On A3 with expert parallel, check the verified ZercMoE adapter gate,
+       then prefer fused MC2 when enabled and the EP group
+       size is small enough; otherwise use MC2 within capacity or all-to-all.
     5. On 310P, always use all-gather.
     6. On A5 with expert parallel, use MC2 when tokens fit the MC2 capacity
        and the EP size is large enough; otherwise use all-gather when
@@ -470,6 +772,9 @@ def select_moe_comm_method(
         num_tokens (int): The number of tokens in the current batch.
         vllm_config (VllmConfig): Runtime configuration for the model.
         is_draft_model (bool): Whether the model runs in MTP mode.
+        is_decode (bool): Whether the caller explicitly requests a decode path.
+        is_graph_mode (bool): Whether the forward uses graph execution
+            (cudagraph_runtime_mode != NONE), independently of batch type.
 
     Raises:
         ValueError: If the soc version is unsupported.
@@ -478,6 +783,8 @@ def select_moe_comm_method(
         MoECommType | None: The selected MoE communication method.
     """
     if not is_moe_model(vllm_config):
+        if getattr(get_ascend_config(), "zercmoe_single_weight", False) is True:
+            raise RuntimeError("A3 ZercMoE single-weight requires an eligible MoE model; fallback is unavailable.")
         return None
 
     mc2_tokens_capacity = get_mc2_tokens_capacity()
@@ -492,13 +799,22 @@ def select_moe_comm_method(
         # forward and _dummy_run during profile_run.
         moe_comm_type = MoECommType.ALLTOALL
     elif soc_version == AscendDeviceType.A2:
-        moe_comm_type = _select_a2_moe_comm_method(num_tokens, vllm_config, mc2_tokens_capacity)
+        moe_comm_type = _select_a2_moe_comm_method(
+            num_tokens,
+            vllm_config,
+            mc2_tokens_capacity,
+            is_decode=is_decode,
+            is_draft_model=is_draft_model,
+            is_graph_mode=is_graph_mode,
+        )
     elif soc_version == AscendDeviceType.A3:
         moe_comm_type = _select_a3_moe_comm_method(
             num_tokens,
             mc2_tokens_capacity,
             vllm_config,
             is_draft_model=is_draft_model,
+            is_decode=is_decode,
+            is_graph_mode=is_graph_mode,
         )
     elif soc_version == AscendDeviceType.A5:
         moe_comm_type = _select_a5_moe_comm_method(num_tokens, vllm_config, mc2_tokens_capacity)
@@ -507,12 +823,29 @@ def select_moe_comm_method(
 
     else:
         raise ValueError(f"Unsupported soc_version: {soc_version}")
+    if (
+        getattr(get_ascend_config(), "zercmoe_single_weight", False) is True
+        and not is_draft_model
+        and moe_comm_type != MoECommType.ZERC_MOE
+    ):
+        raise RuntimeError(
+            "A3 ZercMoE single-weight cannot fall back to another MoE backend: "
+            f"selected={moe_comm_type}, tokens={num_tokens}, graph={is_graph_mode}, draft={is_draft_model}."
+        )
     logger.debug(
-        "MoE comm method selected: soc=%s, method=%s, num_tokens=%d, mc2_capacity=%s",
+        "MoE comm method selected: soc=%s, method=%s, num_tokens=%d, "
+        "mc2_capacity=%s, zercmoe_capacity=%s, graph=%s, draft=%s",
         soc_version,
         moe_comm_type,
         num_tokens,
         mc2_tokens_capacity,
+        (
+            get_zercmoe_tokens_capacity(vllm_config)
+            if soc_version == AscendDeviceType.A3 and getattr(get_ascend_config(), "enable_zerc_moe", 0) == 1
+            else None
+        ),
+        is_graph_mode,
+        is_draft_model,
     )
     return moe_comm_type
 
@@ -525,6 +858,7 @@ class _ExtraForwardContextProxy:
         "moe_comm_type",
         "moe_comm_method",
         "use_mega_moe",
+        "use_zerc_moe",
         "is_decode_only_node",
         "mmrs_fusion",
         "num_tokens",
@@ -533,6 +867,7 @@ class _ExtraForwardContextProxy:
         "padded_length",
         "num_tokens_across_dp",
         "mc2_mask",
+        "mc2_num_actual_tokens",
         "is_draft_model",
         "is_draft_model_prefill",
         "prefetch_mlp_gate_up_proj",
@@ -543,6 +878,8 @@ class _ExtraForwardContextProxy:
         "max_tokens_across_pcp",
         "num_accept_tokens",
         "in_profile_run",
+        "request_forward",
+        "zercmoe_graph_execution",
         "padded_num_tokens",
         "sinks",
         "eplb_heat_collection_status",

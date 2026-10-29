@@ -219,7 +219,15 @@ class NPUWorker(WorkerBase):
                 except Exception:
                     return
 
+    def _reject_zercmoe_single_weight_lifecycle(self, operation: str) -> None:
+        if (
+            getattr(self, "_zercmoe_single_weight_started", False) is True
+            or getattr(get_ascend_config(), "zercmoe_single_weight", False) is True
+        ):
+            raise RuntimeError(f"A3 ZercMoE single-weight does not support {operation}; restart the service instead.")
+
     def sleep(self, level: int = 1) -> None:
+        self._reject_zercmoe_single_weight_lifecycle("sleep")
         free_bytes_before_sleep = torch.npu.mem_get_info()[0]
         # Save the buffers before level 2 sleep
         if level == 2:
@@ -245,6 +253,7 @@ class NPUWorker(WorkerBase):
         )
 
     def wake_up(self, tags: list[str] | None = None) -> None:
+        self._reject_zercmoe_single_weight_lifecycle("wake up")
         nz_mode = get_ascend_config().weight_nz_mode
         if nz_mode:
             raise ValueError(
@@ -277,6 +286,7 @@ class NPUWorker(WorkerBase):
 
     def init_weight_transfer_engine(self, init_info: dict) -> None:
         """Initialize the HCCL weight transfer process group with the trainer."""
+        self._reject_zercmoe_single_weight_lifecycle("weight transfer")
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
         typed_init_info = self.weight_transfer_engine.parse_init_info(init_info)
@@ -292,6 +302,7 @@ class NPUWorker(WorkerBase):
 
     def start_weight_update(self, is_checkpoint_format: bool = True) -> None:
         """Begin a new weight update; prepares the model for layerwise reload."""
+        self._reject_zercmoe_single_weight_lifecycle("weight updates")
         self._check_weight_transfer_engine()
 
         if self._weight_update_active:
@@ -313,6 +324,7 @@ class NPUWorker(WorkerBase):
 
     def update_weights(self, update_info: dict) -> None:
         """Receive a chunk of weights from the trainer and load them in place."""
+        self._reject_zercmoe_single_weight_lifecycle("weight updates")
         self._check_weight_transfer_engine()
         assert self.weight_transfer_engine is not None
 
@@ -348,6 +360,7 @@ class NPUWorker(WorkerBase):
 
     def finish_weight_update(self) -> None:
         """Finish the current weight update; runs layerwise postprocessing."""
+        self._reject_zercmoe_single_weight_lifecycle("weight updates")
         self._check_weight_transfer_engine()
 
         if not self._weight_update_active:
@@ -362,6 +375,17 @@ class NPUWorker(WorkerBase):
 
         self._weight_update_active = False
         self._is_checkpoint_format = True
+
+    def shutdown_zercmoe(self) -> None:
+        """Explicit collective RPC: quiesce and invoke on ALL EP workers first.
+
+        External DP executors must dispatch this concurrently across every DP
+        group. Ordinary shutdown also runs after individual worker failures,
+        so it cannot safely enter the operator's collective destroy barrier.
+        """
+        from vllm_ascend.ops.fused_moe.moe_comm_method import shutdown_zercmoe
+
+        shutdown_zercmoe()
 
     def shutdown(self) -> None:
         if ensure_kv_transfer_shutdown is not None:
@@ -721,6 +745,15 @@ class NPUWorker(WorkerBase):
         return self.model_runner.sample_tokens(grammar_output)
 
     def load_model(self) -> None:
+        if getattr(self, "_zercmoe_single_weight_started", False) is True:
+            raise RuntimeError("A3 ZercMoE single-weight cannot reload the model; restart the service instead.")
+        single_weight = getattr(get_ascend_config(), "zercmoe_single_weight", False) is True
+        if single_weight:
+            from vllm_ascend.ascend_forward_context import validate_zercmoe_single_weight_config
+
+            validate_zercmoe_single_weight_config(self.vllm_config)
+            # A failed load may already have released some original weights.
+            self._zercmoe_single_weight_started = True
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CaMemAllocator.get_instance()
             assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
@@ -732,6 +765,29 @@ class NPUWorker(WorkerBase):
 
         with context, set_current_vllm_config(self.vllm_config):
             self.model_runner.load_model()
+            # Validate the actual MoE schemes once, before any profile/warmup
+            # can initialize the internal wheel's SHMEM heap. A model-level quantization flag also covers
+            # unsupported FP8/PDMix and KV-cache-only quantization.
+            from vllm_ascend.ascend_forward_context import should_prepare_zercmoe_w8a8_weights
+
+            if single_weight or should_prepare_zercmoe_w8a8_weights(self.vllm_config):
+                from vllm_ascend.ops.fused_moe.zercmoe_adapter import validate_w8a8_model
+
+                validate_w8a8_model(
+                    self.model_runner.get_model(),
+                    require_single_weight=single_weight,
+                )
+            if single_weight:
+                if getattr(self.vllm_config, "speculative_config", None) is not None:
+                    from vllm_ascend.ops.fused_moe.zercmoe_adapter import validate_single_weight_mtp
+
+                    draft = getattr(getattr(self.model_runner, "drafter", None), "model", None)
+                    if draft is None:
+                        raise ValueError("A3 ZercMoE single-weight requires a loaded MTP draft model.")
+                    validate_single_weight_mtp(self.model_runner.get_model(), draft)
+                # Return only unused allocator blocks before the wheel creates
+                # its non-PyTorch SHMEM heap, including with explicit KV sizes.
+                torch.npu.empty_cache()
 
         if self.vllm_config.weight_transfer_config is not None:
             from vllm.distributed.weight_transfer.factory import (
@@ -1110,9 +1166,11 @@ class NPUWorker(WorkerBase):
         return self.model_runner.take_draft_token_ids()
 
     def update_config(self, overrides: dict[str, Any]) -> None:
+        self._reject_zercmoe_single_weight_lifecycle("runtime configuration updates")
         self.model_runner.update_config(overrides)
 
     def reload_weights(self, *args, **kwargs) -> None:
+        self._reject_zercmoe_single_weight_lifecycle("weight reload")
         self.model_runner.reload_weights(*args, **kwargs)
 
     def check_health(self) -> None:

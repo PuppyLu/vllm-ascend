@@ -323,6 +323,97 @@ class PrepareAndFinalizeWithMC2(PrepareAndFinalizeWithAll2All):
         return input_ids
 
 
+class PrepareAndFinalizeWithZercMoE(PrepareAndFinalizeWithMC2):
+    """Uniform EP inputs using the existing DP metadata and TP/SP layout.
+
+    FlashComm1 already supplies a TP shard: validate it without slicing again.
+    Without SP, reuse MC2 padding/slicing and its TP gather/unpad finalizer.
+    A local all-false mask is not an empty collective; every rank participates.
+    """
+
+    def is_all_padding_batch(self):
+        """Cheap host-only eligibility; prepare still validates the layout."""
+        # This host-side decision would be frozen at capture time. A replay
+        # must read the current token mask even when capture had no real rows.
+        if getattr(_EXTRA_CTX, "zercmoe_graph_execution", False):
+            return False
+        target = _EXTRA_CTX.padded_num_tokens
+        actual = getattr(_EXTRA_CTX, "mc2_num_actual_tokens", None)
+        return (
+            target is not None
+            and target > 0
+            and actual is not None
+            and 0 <= actual <= self.tp_rank * (target // self.tp_size)
+        )
+
+    def prepare(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        enable_shared_expert_dp: bool = False,
+        replace_allreduce: bool = False,
+        quant_type=QuantType.NONE,
+        *,
+        padding_inputs_factory=None,
+    ) -> MoEPrepareOutput:
+        # Per-call state: never reuse the previous layer/batch's eligibility.
+        self.padding_inputs = None
+        target = _EXTRA_CTX.padded_num_tokens
+        mask = _EXTRA_CTX.mc2_mask
+        if target is None or target < 0 or target % self.tp_size:
+            raise ValueError("ZERC_MOE requires an EP-uniform token count aligned to TP.")
+        if mask is None or mask.dtype != torch.bool or mask.shape != (target,):
+            raise ValueError("ZERC_MOE requires a full padding mask matching padded_num_tokens.")
+        if router_logits.shape[0] != hidden_states.shape[0]:
+            raise ValueError("ZERC_MOE activations and router logits must have the same token count.")
+        local_target = target // self.tp_size
+        if replace_allreduce and hidden_states.shape[0] != local_target:
+            raise ValueError("ZERC_MOE FlashComm1 input must already be the uniform TP shard.")
+        if not replace_allreduce and hidden_states.shape[0] > target:
+            raise ValueError("ZERC_MOE input exceeds the synchronized DP padding length.")
+        self.all_ranks_empty = target == 0
+        self.input_dtype = hidden_states.dtype
+        # Use exactly the host count that built mc2_mask, not hidden_states'
+        # possibly padded shape. Unknown metadata retains the conservative path.
+        actual = getattr(_EXTRA_CTX, "mc2_num_actual_tokens", None)
+        self.all_tokens_valid = (
+            not getattr(_EXTRA_CTX, "zercmoe_graph_execution", False)
+            and actual is not None
+            and local_target > 0
+            and actual >= (self.tp_rank + 1) * local_target
+        )
+        self.all_tokens_padding = self.is_all_padding_batch()
+        if self.all_tokens_padding and quant_type == QuantType.W8A8 and padding_inputs_factory is not None:
+            # No real rows are read here. Keep the original tensors for shared
+            # experts, and keep the same gather/unpad metadata as MC2 prepare.
+            self.replace_allreduce = replace_allreduce
+            self.num_tokens = hidden_states.shape[0]
+            local_mask = mask.narrow(0, self.tp_rank * local_target, local_target)
+            self.padding_inputs = padding_inputs_factory(hidden_states, local_target, local_mask)
+            x, _, probs = self.padding_inputs
+            # The selector is skipped on this path. Preserve its metadata
+            # without allocating a second cached [M,E] dummy logits tensor.
+            zeros = probs if router_logits.dtype == torch.float32 else x
+            return MoEPrepareOutput(
+                hidden_states=x,
+                router_logits=zeros[:, :1].expand(local_target, router_logits.shape[1]),
+                mc2_mask=local_mask,
+                padded_hidden_states_shape=hidden_states.shape
+                if replace_allreduce
+                else torch.Size((target, x.shape[1])),
+                pertoken_scale=None,
+            )
+        result = super().prepare(hidden_states, router_logits, enable_shared_expert_dp, replace_allreduce, quant_type)
+        if result.hidden_states.shape[0] != local_target or result.mc2_mask.shape != (local_target,):
+            raise ValueError("ZERC_MOE prepared input and mask do not match the uniform EP token count.")
+        return result
+
+    def finalize(self, hidden_states, reduce_results, padded_hidden_states_shape=None):
+        if self.all_ranks_empty:
+            return hidden_states
+        return super().finalize(hidden_states, reduce_results, padded_hidden_states_shape)
+
+
 class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
     """
     MoE communication strategy using All-Gather + Reduce-Scatter on EP group.

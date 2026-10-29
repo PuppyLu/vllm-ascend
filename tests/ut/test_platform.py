@@ -338,6 +338,68 @@ class TestNPUPlatform(TestBase):
 
         self.assertTrue(kwargs["in_profile_run"])
 
+    def test_set_additional_forward_context_preserves_explicit_v2_draft_identity(self):
+        from vllm_ascend.worker.v2.spec_decode.forward_config import create_draft_forward_config
+
+        target_config = TestNPUPlatform.mock_vllm_config()
+        target_config.use_v2_model_runner = True
+        draft_config = create_draft_forward_config(target_config)
+
+        with (
+            patch("vllm_ascend.platform.is_moe_model", return_value=True),
+            patch("vllm_ascend.platform.enable_sp", return_value=False),
+            patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=4),
+            patch("vllm.distributed.get_dp_group", return_value=MagicMock(world_size=1)),
+            patch("vllm_ascend.ascend_forward_context.get_mc2_mask", return_value=None),
+            patch(
+                "vllm_ascend.ascend_forward_context.select_moe_comm_method",
+                return_value=MoECommType.MC2,
+            ) as select_comm,
+            patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_moe_comm_method", return_value=object()),
+        ):
+            kwargs = self.platform.set_additional_forward_context(
+                attn_metadata=None,
+                vllm_config=draft_config,
+                dp_metadata=None,
+                num_tokens=1,
+                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            )
+
+        self.assertTrue(kwargs["is_draft_model"])
+        self.assertEqual(kwargs["mc2_num_actual_tokens"], 1)
+        self.assertNotIn("request_forward", kwargs)
+        self.assertNotIn("_ascend_is_draft_model", target_config.additional_config)
+        select_comm.assert_called_once_with(1, draft_config, is_draft_model=True, is_graph_mode=False)
+
+    def test_set_additional_forward_context_passes_graph_mode_separately(self):
+        vllm_config = TestNPUPlatform.mock_vllm_config()
+        vllm_config.use_v2_model_runner = True
+
+        for mode in (CUDAGraphMode.NONE, CUDAGraphMode.FULL):
+            with (
+                self.subTest(mode=mode),
+                patch("vllm_ascend.platform.is_moe_model", return_value=True),
+                patch("vllm_ascend.platform.enable_sp", return_value=False),
+                patch("vllm.distributed.get_tensor_model_parallel_world_size", return_value=4),
+                patch("vllm.distributed.get_dp_group", return_value=MagicMock(world_size=1)),
+                patch(
+                    "vllm_ascend.ascend_forward_context.select_moe_comm_method", return_value=MoECommType.ALLGATHER
+                ) as select_comm,
+                patch("vllm_ascend.ascend_forward_context.get_mc2_mask", return_value=None),
+                patch("vllm_ascend.ops.fused_moe.moe_comm_method.get_moe_comm_method", return_value=object()),
+            ):
+                self.platform.set_additional_forward_context(
+                    attn_metadata=None,
+                    vllm_config=vllm_config,
+                    dp_metadata=None,
+                    num_tokens=5,
+                    cudagraph_runtime_mode=mode,
+                )
+
+                select_comm.assert_called_once_with(
+                    5, vllm_config, is_draft_model=False, is_graph_mode=mode != CUDAGraphMode.NONE
+                )
+
     @patch("vllm_ascend.quantization.utils.maybe_auto_detect_quantization")
     @patch("vllm_ascend.ascend_config.init_ascend_config")
     @patch("vllm_ascend.utils.get_ascend_device_type", return_value=AscendDeviceType.A3)

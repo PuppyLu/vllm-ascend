@@ -36,7 +36,7 @@ from vllm.model_executor.layers.fused_moe.layer import (
 from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import UnquantizedFusedMoEMethod
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, use_cann_megamoe
+from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, use_cann_megamoe, use_cann_zercmoe
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_utils import init_eplb_config
@@ -45,6 +45,7 @@ from vllm_ascend.ops.activation import AscendSituAndMul, SituActivationConfig
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_comm_method import AllGatherCommImpl, FusedExpertsResult, setup_moe_comm_method
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.ops.fused_moe.zercmoe_adapter import can_skip_w8a8_padding_routing, needs_w8a8_dispatch_event
 from vllm_ascend.quantization.methods.base import get_moe_num_logical_experts
 from vllm_ascend.quantization.quant_type import QuantType
 from vllm_ascend.utils import (
@@ -54,6 +55,7 @@ from vllm_ascend.utils import (
     shared_expert_dp_enabled,
     shared_experts_calculation_stream,
 )
+from vllm_ascend.zercmoe_config import is_zercmoe_draft_model_loading, use_shared_expert_overlap
 
 
 def get_compressed_expert_map(expert_map: torch.Tensor) -> str:
@@ -145,7 +147,24 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         # npu_format_cast. At that point, the operator should be able to handle weights
         # in their native format without explicit casting here.
         enable_fused_mc2 = get_ascend_config().enable_fused_mc2
-        if enable_fused_mc2:
+        # Check config/role before importing bundled SHMEM libraries. The
+        # runtime helper already checks wheel availability in worker context.
+        draft_only = is_zercmoe_draft_model_loading()
+        use_zercmoe = not draft_only and enable_fused_mc2 and use_cann_zercmoe(get_current_vllm_config())
+        if use_zercmoe:
+            # ZercMoE consumes per-expert weights packed in its zN flat layout
+            # (zercmoe.pack_weights). Keep the ND [E, k, 2*inter] / [E, inter,
+            # k] tensors (transposed above) for the ALLGATHER decode path and
+            # add the packed 1D copies for the ZERC_MOE prefill path. Dual
+            # retention costs one extra routed-expert weight copy (measured
+            # +15 GB/rank on Qwen3.5-35B, KV -50%); dropping the ND originals
+            # requires decode to take ZERC_MOE too, which is only viable on
+            # large-EP topologies (topK < EP) — decode ZERC measured +11%
+            # TPOT at EP4/topK8.
+            import zercmoe
+
+            layer.w13_weight_zr, layer.w2_weight_zr = zercmoe.pack_weights(layer.w13_weight.data, layer.w2_weight.data)
+        elif enable_fused_mc2:
             use_megamoe = use_cann_megamoe(get_current_vllm_config())
             if not use_megamoe:
                 layer.w13_weight.data = torch_npu.npu_format_cast(layer.w13_weight.data, ACL_FORMAT_FRACTAL_NZ)
@@ -256,7 +275,17 @@ class AscendUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
         w13_weight_list = getattr(layer, "w13_weight_list", None)
         w2_weight_list = getattr(layer, "w2_weight_list", None)
         has_split_weight_lists = isinstance(w13_weight_list, list) and isinstance(w2_weight_list, list)
-        if _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
+        if _EXTRA_CTX.moe_comm_type == MoECommType.ZERC_MOE:
+            # ZERC_MOE consumes the pre-packed zN 1D weight copies (see
+            # process_weights_after_loading); scales/biases stay None (bf16
+            # A16W16 only).
+            w1 = layer.w13_weight_zr
+            w2 = layer.w2_weight_zr
+            w1_scale = None
+            w2_scale = None
+            w1_scale_bias = None
+            w2_scale_bias = None
+        elif _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2:
             if _EXTRA_CTX.use_megamoe:
                 w1 = w13_weight_list if isinstance(w13_weight_list, list) else [layer.w13_weight]
                 w2 = w2_weight_list if isinstance(w2_weight_list, list) else [layer.w2_weight]
@@ -408,9 +437,14 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             )
 
         self.enable_shared_expert_dp = ascend_config.enable_shared_expert_dp
-        self.multistream_overlap_shared_expert = (
-            ascend_config.multistream_overlap_shared_expert and shared_experts is not None
+        self.multistream_overlap_shared_expert = use_shared_expert_overlap(
+            configured=ascend_config.multistream_overlap_shared_expert,
+            has_shared_experts=shared_experts is not None,
         )
+        if ascend_config.enable_zerc_moe and self.quant_type == QuantType.W8A8:
+            routed_experts.zercmoe_needs_dispatch_event = needs_w8a8_dispatch_event(
+                shared_experts, self.multistream_overlap_shared_expert
+            )
         mix_placement = getattr(ascend_config, "mix_placement", False)
 
         # EPLB initialization (Ascend-specific; mirrors old AscendFusedMoE logic).
@@ -625,6 +659,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
                 MoECommType.ALLTOALL,
                 MoECommType.MC2,
                 MoECommType.FUSED_MC2,
+                MoECommType.ZERC_MOE,
             }
             or (moe_comm_type == MoECommType.ALLGATHER and _EXTRA_CTX.flash_comm_v1_enabled)
             or (self._allgather_requires_early_routed_reduce)
@@ -707,7 +742,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # `maybe_all_reduce_tensor_model_parallel`.
         moe_comm_type = _EXTRA_CTX.moe_comm_type
         if (
-            moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2}
+            moe_comm_type in {MoECommType.ALLTOALL, MoECommType.MC2, MoECommType.FUSED_MC2, MoECommType.ZERC_MOE}
             and not shared_expert_dp_enabled()
         ):
             shared_out = tensor_model_parallel_all_reduce(shared_out)
@@ -735,12 +770,37 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         if lora_context is not None:
             sync_lora_context(self._quant_method, lora_context)
 
+        padding_kwargs = {}
+        if (
+            _EXTRA_CTX.moe_comm_type == MoECommType.ZERC_MOE
+            and self.quant_type == QuantType.W8A8
+            and _EXTRA_CTX.moe_comm_method.prepare_finalize.is_all_padding_batch()
+        ):
+            scheme = self._quant_method
+            scheme = getattr(scheme, "quant_method", scheme)
+            if getattr(scheme, "_prepare_zercmoe_w8a8", False) and can_skip_w8a8_padding_routing(
+                self.routed_experts,
+                hidden_states,
+                router_logits,
+                top_k=self.top_k,
+                renormalize=self.renormalize,
+                use_grouped_topk=self.use_grouped_topk,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                scoring_func=self.scoring_func,
+                e_score_correction_bias=self.e_score_correction_bias,
+                custom_routing_function=self.custom_routing_function,
+                tid2eid=self.tid2eid,
+                enable_force_load_balance=enable_force_load_balance,
+            ):
+                padding_kwargs["padding_top_k"] = self.top_k
         prepare_output = _EXTRA_CTX.moe_comm_method.prepare(
             hidden_states=hidden_states,
             router_logits=router_logits,
             replace_allreduce=_EXTRA_CTX.flash_comm_v1_enabled,
             enable_shared_expert_dp=self.enable_shared_expert_dp,
             quant_type=self.quant_type,
+            **padding_kwargs,
         )
         hidden_states = prepare_output.hidden_states
         router_logits = prepare_output.router_logits
@@ -752,29 +812,34 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # apply() expects a RoutedExperts-like layer for weight access
         # (w13_weight, w2_weight, swiglu_limit, etc.). Pass routed_experts,
         # not self; the routing params come through the other kwargs.
-        fused_experts_results: FusedExpertsResult = self._quant_method.apply(
-            layer=self.routed_experts,
-            x=hidden_states,
-            router_logits=router_logits,
-            pertoken_scale=pertoken_scale,
-            top_k=self.top_k,
-            renormalize=self.renormalize,
-            use_grouped_topk=self.use_grouped_topk,
-            num_experts=self.moe_config.num_experts,
-            expert_map=self._expert_map,
-            topk_group=self.topk_group,
-            num_expert_group=self.num_expert_group,
-            custom_routing_function=self.custom_routing_function,
-            scoring_func=self.scoring_func,
-            routed_scaling_factor=self._original_routed_scaling_factor,
-            e_score_correction_bias=self.e_score_correction_bias,
-            activation=self.activation,
-            apply_router_weight_on_input=self.apply_router_weight_on_input,
-            enable_force_load_balance=enable_force_load_balance,
-            log2phy=self.log2phy,
-            global_redundant_expert_num=self.global_redundant_expert_num,
-            mc2_mask=mc2_mask,
-        )
+        if _EXTRA_CTX.moe_comm_type == MoECommType.ZERC_MOE and hidden_states.shape[0] == 0:
+            # Zerc prepare validates an empty synchronized EP batch. Avoid
+            # launching even the routing kernel for zero physical rows.
+            fused_experts_results = FusedExpertsResult(routed_out=hidden_states)
+        else:
+            fused_experts_results: FusedExpertsResult = self._quant_method.apply(
+                layer=self.routed_experts,
+                x=hidden_states,
+                router_logits=router_logits,
+                pertoken_scale=pertoken_scale,
+                top_k=self.top_k,
+                renormalize=self.renormalize,
+                use_grouped_topk=self.use_grouped_topk,
+                num_experts=self.moe_config.num_experts,
+                expert_map=self._expert_map,
+                topk_group=self.topk_group,
+                num_expert_group=self.num_expert_group,
+                custom_routing_function=self.custom_routing_function,
+                scoring_func=self.scoring_func,
+                routed_scaling_factor=self._original_routed_scaling_factor,
+                e_score_correction_bias=self.e_score_correction_bias,
+                activation=self.activation,
+                apply_router_weight_on_input=self.apply_router_weight_on_input,
+                enable_force_load_balance=enable_force_load_balance,
+                log2phy=self.log2phy,
+                global_redundant_expert_num=self.global_redundant_expert_num,
+                mc2_mask=mc2_mask,
+            )
 
         if self.dynamic_eplb and _EXTRA_CTX.eplb_heat_collection_status:
             expert_tokens = fused_experts_results.expert_tokens

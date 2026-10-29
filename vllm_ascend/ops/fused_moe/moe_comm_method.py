@@ -15,6 +15,7 @@
 # This file is a part of the vllm-ascend project.
 from __future__ import annotations
 
+import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
@@ -40,6 +41,7 @@ from vllm_ascend.ops.fused_moe.prepare_finalize import (
     PrepareAndFinalizeWithAll2All,
     PrepareAndFinalizeWithAllGather,
     PrepareAndFinalizeWithMC2,
+    PrepareAndFinalizeWithZercMoE,
 )
 from vllm_ascend.ops.fused_moe.token_dispatcher import (
     MoETokenDispatcher,
@@ -47,23 +49,85 @@ from vllm_ascend.ops.fused_moe.token_dispatcher import (
     TokenDispatcherWithAllGather,
     TokenDispatcherWithMC2,
 )
+from vllm_ascend.ops.fused_moe.zercmoe_adapter import (
+    get_w8a8_operator,
+    make_w8a8_padding_ids,
+    prepare_w8a8_input,
+    validate_w8a8_payload,
+)
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+from vllm_ascend.zercmoe_config import ZERCMOE_MIN_SHMEM_MB, is_zercmoe_draft_model_loading
 
 _MoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
+_DraftMoECommMethods: dict[MoECommType | None, MoECommMethod] = {}
+
+# Default SHMEM bootstrap address for the ZercMoE transport (single node).
+# Override with additional_config.zercmoe_ipport; must be identical across all
+# ranks of one EP group and unique across concurrent jobs.
+_ZERCMOE_DEFAULT_IPPORT = "tcp://127.0.0.1:28765"
 
 
-def get_moe_comm_method(moe_comm_type: MoECommType | None) -> MoECommMethod | None:
-    return _MoECommMethods.get(moe_comm_type)
+def get_moe_comm_method(moe_comm_type: MoECommType | None, *, is_draft_model: bool = False) -> MoECommMethod | None:
+    return (_DraftMoECommMethods if is_draft_model else _MoECommMethods).get(moe_comm_type)
+
+
+def shutdown_zercmoe() -> None:
+    """Release the ZercMoE buffer during coordinated shutdown on every EP rank.
+
+    Never call this from a finalizer/atexit handler or a single-rank error
+    fallback: the operator's documented destroy method contains a barrier.
+    """
+    comm = _MoECommMethods.get(MoECommType.ZERC_MOE)
+    if comm is not None:
+        comm.close()
+
+
+def initialize_zercmoe_buffer() -> None:
+    """Collective allocation before KV sizing, without launching a MoE kernel."""
+    comm = _MoECommMethods.get(MoECommType.ZERC_MOE)
+    if not isinstance(comm, ZercMoECommImpl):
+        raise RuntimeError("ZERC_MOE communication was not initialized for this model.")
+    comm.initialize_w8a8_buffer()
+
+
+def initialize_zercmoe_padding_ids() -> None:
+    """Create the fixed routing IDs on the eager stream before graph capture."""
+    comm = _MoECommMethods.get(MoECommType.ZERC_MOE)
+    if not isinstance(comm, ZercMoECommImpl):
+        raise RuntimeError("ZERC_MOE communication was not initialized for this model.")
+    comm.initialize_w8a8_padding_ids()
 
 
 def setup_moe_comm_method(moe_config):
+    draft_only = is_zercmoe_draft_model_loading()
+    methods = _DraftMoECommMethods if draft_only else _MoECommMethods
+    if getattr(get_ascend_config(), "zercmoe_single_weight", False) is True:
+        existing = methods.get(MoECommType.MC2) or methods.get(MoECommType.ALLGATHER)
+        previous = getattr(existing, "moe_config", None)
+        if previous is not None:
+            fields = (
+                "ep_size",
+                "tp_size",
+                "dp_size",
+                "pcp_size",
+                "num_experts",
+                "num_local_experts",
+                "experts_per_token",
+                "hidden_dim",
+                "intermediate_size_per_partition",
+            )
+            if any(getattr(previous, field, None) != getattr(moe_config, field, None) for field in fields):
+                raise ValueError("A3 ZercMoE single-weight requires consistent MoE configuration within each model.")
     if moe_config.ep_size > 1:
-        _MoECommMethods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
-        _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
-        _MoECommMethods[MoECommType.MC2] = MC2CommImpl(moe_config)
-        _MoECommMethods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
+        methods[MoECommType.ALLTOALL] = AlltoAllCommImpl(moe_config)
+        methods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
+        methods[MoECommType.MC2] = MC2CommImpl(moe_config)
+        methods[MoECommType.FUSED_MC2] = FusedMC2CommImpl(moe_config)
+        if not draft_only:
+            methods[MoECommType.ZERC_MOE] = ZercMoECommImpl(moe_config)
     else:
-        _MoECommMethods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
+        methods[MoECommType.ALLGATHER] = AllGatherCommImpl(moe_config)
 
 
 def set_gmmswigluquant_method():
@@ -522,6 +586,486 @@ class FusedMC2CommImpl(MoECommMethod):
             raise ValueError(f"Wrong value of {get_ascend_config().enable_fused_mc2=}")
         return FusedExpertsResult(
             routed_out=out,
+            expert_tokens=expert_tokens,
+            swiglu_limit=fused_experts_input.swiglu_limit,
+            swiglu_alpha=fused_experts_input.swiglu_alpha,
+            swiglu_beta=fused_experts_input.swiglu_beta,
+        )
+
+
+class ZercMoECommImpl(MoECommMethod):
+    """A3 ZercMoE W8A8 backend; A2 retains its BF16 ABI.
+
+    Prefill, decode and mixed eager batches share this interface. Uniform
+    EP padding and TP/SP finalization use the existing MC2 preparation. Each
+    buffer is created collectively from rank-invariant capacity settings.
+    """
+
+    def __init__(self, moe_config):
+        super().__init__(moe_config)
+        self._zercmoe = None
+        self._a3_zercmoe = None
+        self.zerc_symm_buffer = None
+        self._zerc_buffer_weight_dtype = None
+        self._zerc_buffer_input_dtype = None
+        self._zerc_w8a8_operator = None
+        self._logged_zercmoe_launch = False
+        self._logged_zercmoe_fallbacks = set()
+        self._w8a8_padding_ids = None
+        self._w8a8_padding_key = None
+        self._w8a8_padding_inputs = None
+        self._w8a8_padding_inputs_key = None
+
+    def log_request_fallback(self, method, *, graph, num_tokens, capacity):
+        """Report each fallback reason once, outside capture and dummy runs."""
+        if self.token_dispatcher.ep_rank_id != 0:
+            return
+        reason = (
+            "graph" if graph else "capacity" if num_tokens is not None and num_tokens > capacity else "configuration"
+        )
+        key = (method, reason)
+        if key in self._logged_zercmoe_fallbacks:
+            return
+        self._logged_zercmoe_fallbacks.add(key)
+        logger.info(
+            "A3 ZercMoE request fallback: method=%s reason=%s num_tokens=%s capacity=%s. "
+            "This request forward uses the original MoE backend.",
+            method,
+            reason,
+            num_tokens,
+            capacity,
+        )
+
+    def _log_request_launch(self, num_tokens):
+        if (
+            self._logged_zercmoe_launch
+            or self.token_dispatcher.ep_rank_id != 0
+            or _EXTRA_CTX.request_forward is not True
+            or _EXTRA_CTX.in_profile_run
+            or _EXTRA_CTX.is_draft_model
+        ):
+            return
+        self._logged_zercmoe_launch = True
+        logger.info(
+            "A3 ZercMoE request launched: backend=zercmoe.mega_moe mode=%s EP=%s local_rows=%s. "
+            "The asynchronous call was submitted; this is not a device completion check.",
+            "graph" if getattr(_EXTRA_CTX, "zercmoe_graph_execution", False) else "eager",
+            self.token_dispatcher.ep_world_size,
+            num_tokens,
+        )
+
+    def log_request_graph_selection(self, num_tokens):
+        """Log graph selection outside capture, without claiming device execution."""
+        if getattr(self, "_logged_zercmoe_graph_selection", False) or self.token_dispatcher.ep_rank_id != 0:
+            return
+        self._logged_zercmoe_graph_selection = True
+        logger.info(
+            "A3 ZercMoE decode graph selected: EP=%s tokens=%s. "
+            "Selection alone does not confirm graph replay or numerical correctness.",
+            self.token_dispatcher.ep_world_size,
+            num_tokens,
+        )
+
+    def pad_and_split_input_ids(self, input_ids):
+        return self.prepare_finalize.pad_and_split_input_ids(input_ids)  # type: ignore[attr-defined]
+
+    def _get_token_dispatcher(self):
+        if get_ascend_device_type() == AscendDeviceType.A3:
+            from vllm.config import get_current_vllm_config
+
+            from vllm_ascend.ascend_forward_context import get_zercmoe_tokens_capacity
+
+            return TokenDispatcherWithMC2(
+                is_fused_mc2=True, token_capacity=get_zercmoe_tokens_capacity(get_current_vllm_config())
+            )
+        return TokenDispatcherWithMC2(is_fused_mc2=True)
+
+    def _get_prepare_finalize(self):
+        return PrepareAndFinalizeWithZercMoE(self.moe_config)
+
+    def prepare(
+        self,
+        hidden_states,
+        router_logits,
+        enable_shared_expert_dp=False,
+        replace_allreduce=False,
+        quant_type=QuantType.NONE,
+        *,
+        padding_top_k=None,
+    ):
+        factory = None
+        if padding_top_k is not None and quant_type == QuantType.W8A8:
+            # The runner has checked that this layer uses standard routing.
+            # Prepare invokes this only after proving the entire shard is padding.
+            def factory(x, rows, mask):
+                return self._get_w8a8_padding_inputs_for_shape(x, padding_top_k, mask, rows)
+
+        return self.prepare_finalize.prepare(
+            hidden_states,
+            router_logits,
+            enable_shared_expert_dp,
+            replace_allreduce,
+            quant_type,
+            padding_inputs_factory=factory,
+        )
+
+    def close(self):
+        """All EP ranks must enter this normal shutdown path together."""
+        if self.zerc_symm_buffer is None:
+            return
+        # Forward is asynchronous. Finish all streams before releasing the
+        # buffer. The external A2 destroy also enters a cross-rank barrier.
+        torch.npu.synchronize()
+        self.zerc_symm_buffer.destroy()
+        self.zerc_symm_buffer = None
+        self._zerc_buffer_weight_dtype = None
+        self._zerc_buffer_input_dtype = None
+
+    def _ensure_zercmoe_loaded(self, *, is_w8a8=False):
+        if is_w8a8:
+            if getattr(self, "_a3_zercmoe", None) is None:
+                self._a3_zercmoe = comm_utils.load_a3_zercmoe_ops()
+        elif self._zercmoe is None:
+            # A2's existing nonquantized backend stays independent of A3.
+            self._zercmoe = comm_utils.load_zercmoe_ops()
+
+    def _init_zerc_symm_buffer(self, w_dtype=torch.bfloat16):
+        # ZercMoECommImpl always builds a TokenDispatcherWithMC2 (see
+        # setup_moe_comm_method), which is where ep_world_size /
+        # max_num_tokens_per_rank live. Assert it so mypy resolves those
+        # attributes off the base dispatcher.
+        assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
+        ascend_config = get_ascend_config()
+        num_max_tokens_per_rank = max(1, int(self.token_dispatcher.max_num_tokens_per_rank))
+        ep_world_size = int(self.token_dispatcher.ep_world_size)
+        ep_rank = int(self.token_dispatcher.ep_rank_id)
+        if ep_world_size <= 0 or not 0 <= ep_rank < ep_world_size:
+            raise ValueError(f"Invalid ZercMoE EP group: rank={ep_rank}, world_size={ep_world_size}.")
+
+        if w_dtype == torch.int8:
+            ep_group = get_mc2_group()
+            if ep_group.world_size != ep_world_size or ep_group.rank_in_group != ep_rank:
+                raise ValueError("ZERC_MOE bootstrap identity must match the dispatcher's actual EP group.")
+            if getattr(ascend_config, "zercmoe_max_recv_token_num", None) is not None:
+                raise ValueError("zercmoe_max_recv_token_num is not part of the internal 1.5 API; remove it.")
+            mem_size_mb = ascend_config.zercmoe_shmem_mb or 0
+            if mem_size_mb and mem_size_mb < ZERCMOE_MIN_SHMEM_MB:
+                raise ValueError(
+                    f"A3 ZercMoE requires zercmoe_shmem_mb=0/None or at least {ZERCMOE_MIN_SHMEM_MB} MB per rank. "
+                    "The explicit minimum is a framework guard, not a guarantee that the heap is sufficient. "
+                    "Automatic sizing is determined by the wheel."
+                )
+            comm_utils.bind_zercmoe_ep_environment(ep_rank, ep_world_size)
+            device_id = torch.npu.current_device()
+            device_count = getattr(torch.npu, "device_count", None)
+            logger.info(
+                "A3 ZercMoE device visibility: EP rank=%s/%s ASCEND_RT_VISIBLE_DEVICES=%s "
+                "visible_device_count=%s current_logical_device=%s",
+                ep_rank,
+                ep_world_size,
+                os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "<unset>"),
+                device_count() if callable(device_count) else "unknown",
+                device_id,
+            )
+            self._ensure_zercmoe_loaded(is_w8a8=True)
+            ipport = ascend_config.zercmoe_ipport or _ZERCMOE_DEFAULT_IPPORT
+            logger.info(
+                "A3 ZercMoE SHMEM buffer: EP=%s rank=%s source_capacity=%s "
+                "ipport=%s mem_size_mb=%s (0 delegates heap sizing to the wheel)",
+                ep_world_size,
+                ep_rank,
+                num_max_tokens_per_rank,
+                ipport,
+                mem_size_mb,
+            )
+            if ep_rank == 0:
+                local_experts = self.moe_config.num_experts // ep_world_size
+                if (
+                    ep_world_size * min(self.moe_config.experts_per_token, local_experts)
+                    > 2 * self.moe_config.experts_per_token
+                ):
+                    logger.warning_once(
+                        "ZercMoE 1.5 may silently truncate routed tokens under skewed expert loads: "
+                        "the reported per-rank capacity is 2*m*topK. This affects eager and graph. "
+                        "Validate hotspot routing against an independent reference before relying on outputs."
+                    )
+                logger.info(
+                    "A3 ZercMoE is eligible for eager and FULL_DECODE_ONLY decode graph batches. "
+                    "SHMEM initialization alone does not indicate a request called ZercMoE."
+                )
+            return self._a3_zercmoe.get_symm_buffer(
+                moe_expert_num=self.moe_config.num_experts,
+                ep_world_size=ep_world_size,
+                num_max_tokens_per_rank=num_max_tokens_per_rank,
+                num_topk=self.moe_config.experts_per_token,
+                hidden=self.moe_config.hidden_dim,
+                intermediate_hidden=self.moe_config.intermediate_size_per_partition,
+                ipport=ipport,
+                device_id=device_id,
+                w_dtype=torch.int8,
+                mem_size_mb=mem_size_mb,
+            )
+
+        # A2 retains its original external-wheel bootstrap environment.
+        rank_environment = {"RANK": ep_rank, "WORLD_SIZE": ep_world_size}
+        for name, expected in rank_environment.items():
+            value = os.environ.get(name)
+            if value is None:
+                continue
+            try:
+                actual = int(value)
+            except ValueError as exc:
+                raise ValueError(f"ZercMoE requires integer {name} matching its EP group; got {value!r}.") from exc
+            if actual != expected:
+                raise ValueError(
+                    f"ZercMoE {name}={actual} does not match its EP group value {expected}. "
+                    "Check the worker launch environment and EP group before initializing SHMEM."
+                )
+        for name, expected in rank_environment.items():
+            os.environ.setdefault(name, str(expected))
+
+        self._ensure_zercmoe_loaded()
+        ipport = ascend_config.zercmoe_ipport or _ZERCMOE_DEFAULT_IPPORT
+        mem_size_mb = ascend_config.zercmoe_shmem_mb or 0
+        logger.info(
+            "ZercMoE sym-buffer alloc (must match across all EP ranks): "
+            "ep_world=%s num_max_tokens_per_rank=%s num_experts=%s topk=%s hidden=%s "
+            "intermediate=%s ipport=%s mem_size_mb=%s",
+            ep_world_size,
+            num_max_tokens_per_rank,
+            self.moe_config.num_experts,
+            self.moe_config.experts_per_token,
+            self.moe_config.hidden_dim,
+            self.moe_config.intermediate_size_per_partition,
+            ipport,
+            mem_size_mb,
+        )
+        return self._zercmoe.get_symm_buffer(
+            moe_expert_num=self.moe_config.num_experts,
+            ep_world_size=ep_world_size,
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
+            num_topk=self.moe_config.experts_per_token,
+            hidden=self.moe_config.hidden_dim,
+            intermediate_hidden=self.moe_config.intermediate_size_per_partition,
+            ipport=ipport,
+            device_id=torch.npu.current_device(),
+            mem_size_mb=mem_size_mb,
+        )
+
+    def initialize_w8a8_buffer(self):
+        """Allocate the single model-wide heap inside KV memory profiling."""
+        if self.zerc_symm_buffer is None:
+            self.zerc_symm_buffer = self._init_zerc_symm_buffer(w_dtype=torch.int8)
+            self._zerc_buffer_weight_dtype = torch.int8
+            self._zerc_buffer_input_dtype = torch.bfloat16
+
+    def _get_w8a8_padding_ids(self, payload):
+        """Reuse the small device vector across layers and repeated eager calls."""
+        if (
+            payload.routing.mc2_mask is None
+            or getattr(self.prepare_finalize, "all_tokens_valid", False)
+            or payload.topk_ids.ndim != 2
+        ):
+            return None
+        key = (
+            self.moe_config.num_experts,
+            self.token_dispatcher.ep_world_size,
+            self.token_dispatcher.ep_rank_id,
+            payload.topk_ids.shape[1],
+            payload.hidden_states.device,
+        )
+        if key != self._w8a8_padding_key:
+            if getattr(_EXTRA_CTX, "zercmoe_graph_execution", False):
+                raise RuntimeError("ZERC_MOE graph padding IDs were not initialized before graph capture.")
+            ids = make_w8a8_padding_ids(
+                num_experts=key[0], ep_world_size=key[1], ep_rank=key[2], top_k=key[3], device=key[4]
+            )
+            self._w8a8_padding_ids, self._w8a8_padding_key = ids, key
+        return self._w8a8_padding_ids
+
+    def initialize_w8a8_padding_ids(self, device=None):
+        """Keep the graph's constant IDs alive outside private graph pools."""
+        key = (
+            self.moe_config.num_experts,
+            self.token_dispatcher.ep_world_size,
+            self.token_dispatcher.ep_rank_id,
+            self.moe_config.experts_per_token,
+            device if device is not None else torch.device("npu", torch.npu.current_device()),
+        )
+        ids = make_w8a8_padding_ids(
+            num_experts=key[0], ep_world_size=key[1], ep_rank=key[2], top_k=key[3], device=key[4]
+        )
+        self._w8a8_padding_ids, self._w8a8_padding_key = ids, key
+
+    def _get_w8a8_padding_inputs(self, payload):
+        """Reuse only dummy inputs, never a previous layer's weights or routing."""
+        x, ids = payload.hidden_states, payload.topk_ids
+        return self._get_w8a8_padding_inputs_for_shape(
+            x, ids.shape[1] if ids.ndim == 2 else None, payload.routing.mc2_mask, x.shape[0] if x.ndim == 2 else 0
+        )
+
+    def _get_w8a8_padding_inputs_for_shape(self, x, top_k, mask, rows):
+        if (
+            not getattr(self.prepare_finalize, "all_tokens_padding", False)
+            or mask is None
+            or x.ndim != 2
+            or top_k is None
+        ):
+            # A large idle DP shard must not keep its zero-input allocation
+            # alive once this rank resumes handling real or mixed tokens.
+            self._w8a8_padding_inputs = None
+            self._w8a8_padding_inputs_key = None
+            return None
+        # Rebuild on stream changes so initialization is ordered before use
+        # without events or host/device synchronization. Keep one bounded entry.
+        stream = torch.npu.current_stream().npu_stream if x.device.type == "npu" else None
+        key = (
+            self.moe_config.num_experts,
+            self.token_dispatcher.ep_world_size,
+            self.token_dispatcher.ep_rank_id,
+            (rows, x.shape[1]),
+            top_k,
+            x.device,
+            x.dtype,
+            stream,
+        )
+        if key != self._w8a8_padding_inputs_key:
+            # Build IDs on this stream too; do not read a vector initialized
+            # by a previous stream's mixed-padding path.
+            padding_ids = make_w8a8_padding_ids(
+                num_experts=key[0], ep_world_size=key[1], ep_rank=key[2], top_k=key[4], device=x.device
+            )
+            inputs = (
+                torch.zeros(key[3], dtype=x.dtype, device=x.device),
+                padding_ids.repeat(rows, 1),
+                torch.zeros((rows, top_k), dtype=torch.float32, device=x.device),
+            )
+            self._w8a8_padding_inputs, self._w8a8_padding_inputs_key = inputs, key
+        return self._w8a8_padding_inputs
+
+    def fused_experts(
+        self,
+        fused_experts_input: MoEFusedExpertsInput,
+        *,
+        record_dispatch_event: bool = True,
+    ):
+        quant_type = fused_experts_input.quant.quant_type
+        is_w8a8 = quant_type == QuantType.W8A8
+        if get_ascend_device_type() == AscendDeviceType.A3 and not is_w8a8:
+            raise ValueError("A3 ZercMoE requires W8A8 weights; the A2 BF16 backend cannot be used on A3.")
+        if quant_type not in (QuantType.NONE, QuantType.W8A8):
+            raise ValueError("ZERC_MOE supports A2 BF16 and A3 BF16-input W8A8 backends only.")
+
+        if fused_experts_input.hidden_states.shape[0] == 0:
+            # This flag comes from synchronized DP metadata in prepare, never
+            # from a rank's local valid-token count or padding mask.
+            if not getattr(self.prepare_finalize, "all_ranks_empty", False):
+                raise ValueError("ZERC_MOE cannot skip an empty local rank without an all-EP-empty batch.")
+            return FusedExpertsResult(
+                routed_out=torch.empty(
+                    fused_experts_input.hidden_states.shape,
+                    device=fused_experts_input.hidden_states.device,
+                    dtype=self.prepare_finalize.input_dtype,
+                )
+            )
+
+        if is_w8a8:
+            padding_inputs = getattr(self.prepare_finalize, "padding_inputs", None)
+            if padding_inputs is None:
+                padding_inputs = self._get_w8a8_padding_inputs(fused_experts_input)
+            fused_experts_input = prepare_w8a8_input(
+                fused_experts_input,
+                all_tokens_valid=getattr(self.prepare_finalize, "all_tokens_valid", False),
+                all_tokens_padding=getattr(self.prepare_finalize, "all_tokens_padding", False),
+                padding_ids=self._get_w8a8_padding_ids(fused_experts_input) if padding_inputs is None else None,
+                padding_inputs=padding_inputs,
+            )
+
+        # Weight packing belongs to model loading, never to a forward call.
+        w1, w2 = fused_experts_input.weights.w1, fused_experts_input.weights.w2
+        weight_dtype = torch.int8 if is_w8a8 else torch.bfloat16
+        assert isinstance(self.token_dispatcher, TokenDispatcherWithMC2)
+        if is_w8a8:
+            validate_w8a8_payload(
+                fused_experts_input,
+                num_experts=self.moe_config.num_experts,
+                ep_world_size=self.token_dispatcher.ep_world_size,
+                hidden=self.moe_config.hidden_dim,
+                intermediate=self.moe_config.intermediate_size_per_partition,
+            )
+        else:
+            if not all(
+                isinstance(weight, torch.Tensor) and weight.dim() == 1 and weight.dtype == weight_dtype
+                for weight in (w1, w2)
+            ):
+                raise ValueError("ZERC_MOE A2 requires pre-packed one-dimensional BF16 weights.")
+            if fused_experts_input.hidden_states.dtype != torch.bfloat16:
+                raise ValueError("ZERC_MOE unquantized inputs must be BF16.")
+        num_tokens = fused_experts_input.hidden_states.shape[0]
+        num_max_tokens = self.token_dispatcher.max_num_tokens_per_rank
+        if num_tokens > num_max_tokens:
+            raise ValueError(
+                f"ZercMoE received {num_tokens} tokens per rank, but its symmetric buffer "
+                f"was allocated for at most {num_max_tokens}. Reduce max-num-batched-tokens "
+                "or disable ZERC_MOE."
+            )
+        if self.zerc_symm_buffer is not None and (
+            self._zerc_buffer_weight_dtype != weight_dtype
+            or self._zerc_buffer_input_dtype != fused_experts_input.hidden_states.dtype
+        ):
+            raise ValueError(
+                "ZERC_MOE cannot reuse a symmetric buffer across different weight dtypes or activation dtypes."
+            )
+
+        if is_w8a8:
+            if self.prepare_finalize.input_dtype != torch.bfloat16:
+                raise ValueError("ZERC_MOE A3 requires the model's BF16 output dtype from prepare.")
+            self._ensure_zercmoe_loaded(is_w8a8=True)
+            if getattr(self, "_zerc_w8a8_operator", None) is None:
+                self._zerc_w8a8_operator = get_w8a8_operator(self._a3_zercmoe)
+
+        # A3 preparation already resolves logical IDs and normalizes routing.
+        # Keep A2's original mapping without constructing another A3 payload.
+        topk_ids = fused_experts_input.topk_ids
+        if not is_w8a8 and fused_experts_input.routing.log2phy is not None:
+            topk_ids = fused_experts_input.routing.log2phy[topk_ids]
+
+        # The quantized shared-expert path does not consume this event. Keep
+        # it for A2 and for callers with an actual shared-stream dependency.
+        before_dispatch_evt = (
+            torch.npu.current_stream().record_event() if record_dispatch_event or not is_w8a8 else None
+        )
+
+        if self.zerc_symm_buffer is None:
+            if is_w8a8:
+                self.initialize_w8a8_buffer()
+            else:
+                self.zerc_symm_buffer = self._init_zerc_symm_buffer()
+                self._zerc_buffer_weight_dtype = weight_dtype
+                self._zerc_buffer_input_dtype = fused_experts_input.hidden_states.dtype
+
+        # A3 uses the public 1.5 wheel API; A2 retains its existing ABI.
+        if is_w8a8:
+            out, expert_tokens = self._zerc_w8a8_operator(fused_experts_input, self.zerc_symm_buffer)
+            self._log_request_launch(num_tokens)
+        else:
+            out, expert_tokens = torch.ops.npu.zerc_moe(
+                fused_experts_input.hidden_states,
+                topk_ids.to(torch.int32),
+                fused_experts_input.topk_weights.to(torch.float32),
+                [w1],
+                [w2],
+                self.zerc_symm_buffer.moe_expert_num,
+                self.zerc_symm_buffer.ep_world_size,
+                self.zerc_symm_buffer.ccl_buffer_size,
+                0,  # topk_weights_type: fp32
+                0,  # return_expert_tokens: counts are only consumed by dynamic
+                # EPLB, which the ZERC_MOE gate excludes (mode=0 skips a per-call
+                # sync: measured 3-9x lower single-call latency).
+            )
+        return FusedExpertsResult(
+            routed_out=out,
+            before_dispatch_evt=before_dispatch_evt,
             expert_tokens=expert_tokens,
             swiglu_limit=fused_experts_input.swiglu_limit,
             swiglu_alpha=fused_experts_input.swiglu_alpha,

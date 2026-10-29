@@ -24,11 +24,18 @@ from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.logger import logger
 
 from vllm_ascend.ascend_config import get_ascend_config
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType, use_cann_megamoe
+from vllm_ascend.ascend_forward_context import (
+    _EXTRA_CTX,
+    MoECommType,
+    should_prepare_zercmoe_w8a8_weights,
+    use_cann_megamoe,
+)
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.experts_selector import select_experts, zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
+from vllm_ascend.ops.fused_moe.zercmoe_adapter import prepare_w8a8_layer
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, enable_dsa_cp, maybe_trans_nz
+from vllm_ascend.zercmoe_config import is_zercmoe_draft_model_loading
 
 from .base import AscendLinearScheme, AscendMoEScheme, QuantType, get_moe_num_logical_experts
 from .registry import register_scheme
@@ -168,6 +175,16 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         self.dynamic_eplb = ascend_config.eplb_config.dynamic_eplb
         self.in_dtype = vllm_config.model_config.dtype
         self.supports_eplb = True
+        # FP8 and PDMix inherit this class but have different contracts.
+        draft_only = getattr(ascend_config, "zercmoe_single_weight", False) is True and is_zercmoe_draft_model_loading()
+        self._prepare_zercmoe_w8a8 = (
+            not draft_only
+            and type(self) is AscendW8A8DynamicFusedMoEMethod
+            and should_prepare_zercmoe_w8a8_weights(vllm_config)
+        )
+        self._zercmoe_single_weight = getattr(ascend_config, "zercmoe_single_weight", False) is True and not draft_only
+        if self._zercmoe_single_weight and not self._prepare_zercmoe_w8a8:
+            raise ValueError("A3 ZercMoE single-weight requires the A3 W8A8_DYNAMIC routed-expert scheme.")
 
         try:
             device_group = get_mc2_group().device_group
@@ -197,14 +214,17 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
     def get_dynamic_quant_param(
         self, num_experts: int, intermediate_size_per_partition: int, hidden_sizes: int, params_dtype: torch.dtype
     ) -> dict[str, Any]:
+        # Preserve checkpoint scale precision before loading; casting BF16
+        # scales to FP32 afterwards cannot recover the discarded bits.
+        scale_dtype = torch.float32 if self._prepare_zercmoe_w8a8 else params_dtype
         param_dict = {}
         param_dict["w13_weight_scale"] = torch.empty(
-            num_experts, 2 * intermediate_size_per_partition, 1, dtype=params_dtype
+            num_experts, 2 * intermediate_size_per_partition, 1, dtype=scale_dtype
         )
         param_dict["w13_weight_offset"] = torch.empty(
             num_experts, 2 * intermediate_size_per_partition, 1, dtype=params_dtype
         )
-        param_dict["w2_weight_scale"] = torch.empty(num_experts, hidden_sizes, 1, dtype=params_dtype)
+        param_dict["w2_weight_scale"] = torch.empty(num_experts, hidden_sizes, 1, dtype=scale_dtype)
         param_dict["w2_weight_offset"] = torch.empty(num_experts, hidden_sizes, 1, dtype=params_dtype)
         return param_dict
 
@@ -234,6 +254,8 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
         mc2_mask: torch.Tensor | None = None,
         tid2eid: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if getattr(layer, "_zercmoe_weights_only", False) and _EXTRA_CTX.moe_comm_type != MoECommType.ZERC_MOE:
+            raise RuntimeError("Zerc-only expert weights cannot be used by a fallback MoE backend.")
         zero_expert_num = getattr(layer, "zero_expert_num", 0)
         zero_expert_type = getattr(layer, "zero_expert_type", None)
         n_shared_experts = getattr(layer, "n_shared_experts", 0)
@@ -256,24 +278,33 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
                 f"zero_expert_type={zero_expert_type}"
             )
 
-        topk_weights, topk_ids = select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-            top_k=top_k,
-            use_grouped_topk=use_grouped_topk,
-            renormalize=renormalize,
-            topk_group=topk_group,
-            num_expert_group=num_expert_group,
-            custom_routing_function=custom_routing_function,
-            scoring_func=scoring_func,
-            routed_scaling_factor=routed_scaling_factor,
-            e_score_correction_bias=e_score_correction_bias,
-            mix_placement=mix_placement,
-            num_logical_experts=router_logits.shape[1],
-            num_shared_experts=n_shared_experts,
-            num_experts=num_logical_experts,
-            tid2eid=tid2eid,
-        )
+        moe_comm_method = _EXTRA_CTX.moe_comm_method
+        padding_inputs = None
+        if _EXTRA_CTX.moe_comm_type == MoECommType.ZERC_MOE and self._prepare_zercmoe_w8a8:
+            padding_inputs = getattr(moe_comm_method.prepare_finalize, "padding_inputs", None)
+        if padding_inputs is not None:
+            # Eligibility was checked before prepare. Physical padding routes
+            # still enter the collective and use this layer's current weights.
+            x, topk_ids, topk_weights = padding_inputs
+        else:
+            topk_weights, topk_ids = select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                top_k=top_k,
+                use_grouped_topk=use_grouped_topk,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                routed_scaling_factor=routed_scaling_factor,
+                e_score_correction_bias=e_score_correction_bias,
+                mix_placement=mix_placement,
+                num_logical_experts=router_logits.shape[1],
+                num_shared_experts=n_shared_experts,
+                num_experts=num_logical_experts,
+                tid2eid=tid2eid,
+            )
         assert topk_ids is not None
         assert topk_weights is not None
         if zero_expert_num > 0 and zero_expert_type is not None:
@@ -292,16 +323,28 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             topk_ids = torch.argsort(random_matrix, dim=1)[:, : topk_ids.size(1)].to(topk_ids.dtype)
 
         assert topk_weights is not None
-        topk_weights = topk_weights.to(self.in_dtype)
+        # Zerc consumes FP32 probabilities; avoid an irreversible BF16/FP16
+        # round trip before entering its fused combine stage.
+        topk_weights = topk_weights.to(
+            torch.float32 if _EXTRA_CTX.moe_comm_type == MoECommType.ZERC_MOE else self.in_dtype
+        )
 
         act_name = getattr(activation, "value", activation)
-        moe_comm_method = _EXTRA_CTX.moe_comm_method
         fused_scale_flag = (
             _EXTRA_CTX.moe_comm_type == MoECommType.FUSED_MC2
             and get_ascend_config().enable_fused_mc2 == 1
             and act_name != "swigluoai_uninterleave"
         )
-        if self.dynamic_eplb:
+        if _EXTRA_CTX.moe_comm_type == MoECommType.ZERC_MOE:
+            if not self._prepare_zercmoe_w8a8 or not all(
+                hasattr(layer, name)
+                for name in ("w13_weight_zr", "w2_weight_zr", "w13_weight_scale_zr_packed", "w2_weight_scale_zr_packed")
+            ):
+                raise ValueError("ZERC_MOE W8A8 weights were not prepared during model loading.")
+            w1, w2 = layer.w13_weight_zr, layer.w2_weight_zr
+            w1_scale, w2_scale = layer.w13_weight_scale_zr_packed, layer.w2_weight_scale_zr_packed
+            w1_scale_bias = w2_scale_bias = None
+        elif self.dynamic_eplb:
             w1 = layer.w13_weight_list
             w1_scale = layer.fused_w1_scale_list if fused_scale_flag else layer.w13_weight_scale_fp32_list
             w2 = layer.w2_weight_list
@@ -325,38 +368,57 @@ class AscendW8A8DynamicFusedMoEMethod(AscendMoEScheme):
             w1_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
             w2_scale_bias = [torch.tensor([], dtype=torch.float32)] if fused_scale_flag else None
 
-        final_hidden_states = moe_comm_method.fused_experts(
-            fused_experts_input=build_fused_experts_input(
-                hidden_states=x,
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                w1=w1,
-                w2=w2,
-                quant_type=self.quant_type,
-                dynamic_eplb=self.dynamic_eplb,
-                expert_map=expert_map,
-                global_redundant_expert_num=global_redundant_expert_num,
-                mc2_mask=mc2_mask,
-                apply_router_weight_on_input=apply_router_weight_on_input,
-                log2phy=log2phy,
-                pertoken_scale=pertoken_scale,
-                activation=activation,
-                w1_scale=w1_scale,
-                w2_scale=w2_scale,
-                w1_scale_bias=w1_scale_bias,
-                w2_scale_bias=w2_scale_bias,
-                swiglu_limit=layer.swiglu_limit,
-                swiglu_alpha=getattr(layer, "swiglu_alpha", 1.0),
-                swiglu_beta=getattr(layer, "swiglu_beta", 0.0),
-            )
+        fused_input = build_fused_experts_input(
+            hidden_states=x,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            w1=w1,
+            w2=w2,
+            quant_type=self.quant_type,
+            dynamic_eplb=self.dynamic_eplb,
+            expert_map=expert_map,
+            global_redundant_expert_num=global_redundant_expert_num,
+            mc2_mask=mc2_mask,
+            apply_router_weight_on_input=apply_router_weight_on_input,
+            log2phy=log2phy,
+            pertoken_scale=pertoken_scale,
+            activation=activation,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            w1_scale_bias=w1_scale_bias,
+            w2_scale_bias=w2_scale_bias,
+            swiglu_limit=layer.swiglu_limit,
+            swiglu_alpha=getattr(layer, "swiglu_alpha", 1.0),
+            swiglu_beta=getattr(layer, "swiglu_beta", 0.0),
         )
+        if _EXTRA_CTX.moe_comm_type == MoECommType.ZERC_MOE:
+            final_hidden_states = moe_comm_method.fused_experts(
+                fused_experts_input=fused_input,
+                record_dispatch_event=getattr(layer, "zercmoe_needs_dispatch_event", True),
+            )
+        else:
+            final_hidden_states = moe_comm_method.fused_experts(fused_experts_input=fused_input)
         if zero_expert_num > 0 and zero_expert_type is not None:
             final_hidden_states += zero_expert_result
         return final_hidden_states
 
     def process_weights_after_loading(self, layer):
+        if getattr(layer, "_zercmoe_weights_only", False):
+            raise RuntimeError("Zerc-only expert weights cannot be reloaded in place; restart the service.")
         layer.w13_weight.data = layer.w13_weight.data.transpose(1, 2).contiguous()
         layer.w2_weight.data = layer.w2_weight.data.transpose(1, 2).contiguous()
+        if self._prepare_zercmoe_w8a8:
+            # The internal wheel packs the original ND INT8 tensors once,
+            # before the legacy backend converts its parameters to FRACTAL_NZ.
+            prepare_w8a8_layer(layer)
+            # Complete packing before releasing its inputs. This is a
+            # loading-time synchronization, never a per-forward barrier.
+            if layer.w13_weight_zr.device.type == "npu":
+                torch.npu.synchronize(device=layer.w13_weight_zr.device)
+            del layer.w13_weight
+            del layer.w2_weight
+            layer._zercmoe_weights_only = True
+            return
         # TODO(zzzzwwjj): Currently, `torch_npu.npu_grouped_matmul_swiglu_quant`
         # can only support weight nz.
         if self.quant_type == QuantType.W8A8:

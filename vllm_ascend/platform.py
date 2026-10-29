@@ -488,6 +488,33 @@ class NPUPlatform(Platform):
 
         compilation_config.cudagraph_num_of_warmups = 1
 
+        # A3's wheel has no validated graph-capture contract. Preserve the
+        # user's graph configuration; captured batches retain their original
+        # backend. --enforce-eager makes both prefill and decode use Zerc.
+        # Do not silently change graph/padding behavior just by enabling it.
+        from vllm_ascend.ascend_forward_context import get_zercmoe_cudagraph_mode, is_zercmoe_active_by_config
+
+        if (
+            not enforce_eager
+            and compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            and get_ascend_device_type() == AscendDeviceType.A3
+            and is_zercmoe_active_by_config(vllm_config)
+        ):
+            logger.warning_once(
+                "A3 ZercMoE is enabled for eager prefill, decode and mixed batches. "
+                "Preserving cudagraph_mode=%s: graph batches use the configured fallback backend. "
+                "Use --enforce-eager to exercise ZercMoE in both P and D stages.",
+                compilation_config.cudagraph_mode,
+            )
+        zercmoe_graph_mode = get_zercmoe_cudagraph_mode(vllm_config)
+        if zercmoe_graph_mode != compilation_config.cudagraph_mode:
+            logger.warning_once(
+                "Demoting cudagraph_mode from FULL to FULL_DECODE_ONLY because the "
+                "ZERC_MOE branch is active (the fused ZercMoE operator must run "
+                "outside graph capture)."
+            )
+            compilation_config.cudagraph_mode = zercmoe_graph_mode
+
         if compilation_config.mode not in [CompilationMode.NONE, CompilationMode.VLLM_COMPILE]:
             logger.warning(
                 "NPU does not support compilation mode. mode=%s, action: setting CUDAGraphMode to NONE.",
@@ -947,6 +974,7 @@ class NPUPlatform(Platform):
             select_moe_comm_method,
         )
         from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
+        from vllm_ascend.worker.v2.spec_decode.forward_config import is_draft_forward_config
         from vllm.distributed import get_dp_group, get_tensor_model_parallel_world_size
 
         # NOTE(Ronald1995): avoid circular import, cudagraph_runtime_mode is
@@ -966,8 +994,9 @@ class NPUPlatform(Platform):
         if not vllm_config.use_v2_model_runner:
             return {}
 
-        # is_draft_model will be removed later, so we set it to False temporarily.
-        is_draft_model = False
+        # V2 drafter forwards may retain the target model_config. The
+        # speculator factory supplies an explicitly marked config view.
+        is_draft_model = is_draft_forward_config(vllm_config)
         # v2 has 2 graphs in eager, one for prefill, the other for decodes, this flag is aimed to distinguish them.
         is_draft_model_prefill = False
         sinks = False
@@ -1014,8 +1043,17 @@ class NPUPlatform(Platform):
         moe_comm_type = select_moe_comm_method(
             max_tokens_across_dp,
             vllm_config,
+            is_draft_model=is_draft_model,
+            is_graph_mode=cudagraph_runtime_mode != CUDAGraphMode.NONE,
         )
-        moe_comm_method = get_moe_comm_method(moe_comm_type)
+        from vllm_ascend.ascend_config import get_ascend_config
+
+        if is_draft_model and getattr(get_ascend_config(), "zercmoe_single_weight", False) is True:
+            moe_comm_method = get_moe_comm_method(moe_comm_type, is_draft_model=True)
+            if moe_comm_type is not None and moe_comm_method is None:
+                raise RuntimeError("A3 ZercMoE single-weight draft MoE communication was not initialized.")
+        else:
+            moe_comm_method = get_moe_comm_method(moe_comm_type)
 
         mc2_mask = None
         padded_num_tokens = None
@@ -1039,6 +1077,7 @@ class NPUPlatform(Platform):
             "padded_length": padded_length,
             "max_tokens_across_dp": max_tokens_across_dp,
             "mc2_mask": mc2_mask,
+            "mc2_num_actual_tokens": num_tokens,
             "is_draft_model": is_draft_model,
             "is_draft_model_prefill": is_draft_model_prefill,
             "in_profile_run": in_profile_run,

@@ -66,6 +66,42 @@ class TestAscendModelSlimConfig(TestBase):
         self.assertIsInstance(config, AscendModelSlimConfig)
         self.assertEqual(config.quant_description, self.sample_config)
 
+    def test_from_config_format_metadata_defers_loading(self):
+        for metadata in (
+            {"quant_method": "ascend"},
+            {"quant_method": "ascend", "model_quant_type": "W8A8"},
+        ):
+            with self.subTest(metadata=metadata):
+                original_metadata = dict(metadata)
+                config = AscendModelSlimConfig.from_config(metadata)
+
+                self.assertEqual(config.quant_description, {})
+                self.assertEqual(config._format_metadata, original_metadata)
+                self.assertIsNot(config._format_metadata, metadata)
+                self.assertEqual(metadata, original_metadata)
+
+    def test_from_config_preserves_inline_description_with_metadata(self):
+        description = {
+            "quant_method": "ascend",
+            "model_quant_type": "W8A8",
+            "model.embed_tokens.weight": "FLOAT",
+            "model.layers.0.mlp.gate_proj.weight": "W8A8_DYNAMIC",
+        }
+        config = AscendModelSlimConfig.from_config(description)
+        with patch("vllm_ascend.quantization.utils.get_model_file") as get_model_file:
+            config.maybe_update_config("/unused/model/path")
+
+        get_model_file.assert_not_called()
+        self.assertEqual(config.quant_description, description)
+        self.assertTrue(config.is_layer_skipped_ascend("model.embed_tokens"))
+        self.assertEqual(
+            get_linear_quant_type(config.quant_description, "model.layers.0.mlp.gate_proj", {}),
+            "W8A8_DYNAMIC",
+        )
+        extended_metadata = {"quant_method": "ascend", "fa_quant_type": "C8"}
+        config = AscendModelSlimConfig.from_config(extended_metadata)
+        self.assertEqual(config.quant_description, extended_metadata)
+
     def test_model_mapping_packed_module_quant_types(self):
         mapping = {
             "gate_up_proj": ["gate_proj", "up_proj"],
@@ -437,6 +473,76 @@ class TestAscendModelSlimConfig(TestBase):
             config.maybe_update_config(tmpdir)
 
         self.assertEqual(config.quant_description, quant_data)
+
+    def test_maybe_update_config_loads_description_with_format_metadata(self):
+        quant_data = {
+            "model.embed_tokens.weight": "FLOAT",
+            "model.layers.0.mlp.gate_proj.weight": "W8A8_DYNAMIC",
+            "model.layers.0.mlp.up_proj.weight_packed": "W8A8_DYNAMIC",
+            "kv_cache_type": "C8",
+            "model.layers.0.self_attn.k_proj.kv_cache_scale": "FLOAT",
+        }
+        for metadata in (
+            {"quant_method": "ascend"},
+            {"quant_method": "ascend", "model_quant_type": "W8A8"},
+        ):
+            with self.subTest(metadata=metadata), tempfile.TemporaryDirectory() as tmpdir:
+                original_metadata = dict(metadata)
+                with open(os.path.join(tmpdir, MODELSLIM_CONFIG_FILENAME), "w") as f:
+                    json.dump(quant_data, f)
+                config = AscendModelSlimConfig.from_config(metadata)
+                config.maybe_update_config(tmpdir)
+
+                self.assertEqual(
+                    config.quant_description,
+                    {**metadata, **quant_data, "model.layers.0.mlp.up_proj.weight": "W8A8_DYNAMIC"},
+                )
+                self.assertTrue(config.is_layer_skipped_ascend("model.embed_tokens"))
+                self.assertEqual(get_linear_quant_type(config.quant_description, "model.embed_tokens", {}), "FLOAT")
+                self.assertEqual(
+                    get_linear_quant_type(config.quant_description, "model.layers.0.mlp.gate_proj", {}),
+                    "W8A8_DYNAMIC",
+                )
+                self.assertTrue(config.enable_c8_quant)
+                self.assertEqual(config.c8_quant_layers, [0])
+                self.assertEqual(metadata, original_metadata)
+                with patch("vllm_ascend.quantization.utils.get_model_file") as get_model_file:
+                    config.maybe_update_config(tmpdir)
+                get_model_file.assert_not_called()
+
+    def test_maybe_update_config_file_metadata_takes_precedence(self):
+        metadata = {"quant_method": "ascend", "model_quant_type": "W8A8"}
+        quant_data = {"model_quant_type": "W8A8_DYNAMIC", "model.embed_tokens.weight": "FLOAT"}
+        config = AscendModelSlimConfig.from_config(metadata)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(os.path.join(tmpdir, MODELSLIM_CONFIG_FILENAME), "w") as f:
+                json.dump(quant_data, f)
+            config.maybe_update_config(tmpdir)
+
+        self.assertEqual(config.quant_description, {**metadata, **quant_data})
+        self.assertEqual(metadata["model_quant_type"], "W8A8")
+
+    def test_maybe_update_config_format_metadata_missing_file_raises(self):
+        config = AscendModelSlimConfig.from_config({"quant_method": "ascend"})
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            self.assertRaisesRegex(ValueError, "ModelSlim Quantization Config Not Found"),
+        ):
+            config.maybe_update_config(tmpdir)
+
+    def test_maybe_update_config_format_metadata_remote_revision(self):
+        metadata = {"quant_method": "ascend"}
+        quant_data = {"model.embed_tokens.weight": "FLOAT"}
+        config = AscendModelSlimConfig.from_config(metadata)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = os.path.join(tmpdir, MODELSLIM_CONFIG_FILENAME)
+            with open(config_path, "w") as f:
+                json.dump(quant_data, f)
+            with patch("vllm_ascend.quantization.utils.get_model_file", return_value=config_path) as get_model_file:
+                config.maybe_update_config("test/model", revision="test-revision")
+
+        get_model_file.assert_called_once_with("test/model", MODELSLIM_CONFIG_FILENAME, revision="test-revision")
+        self.assertEqual(config.quant_description, {**metadata, **quant_data})
 
     def test_maybe_update_config_raises_when_file_missing(self):
         config = AscendModelSlimConfig()

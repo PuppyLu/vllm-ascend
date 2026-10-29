@@ -517,6 +517,7 @@ class AscendModelSlimConfig(QuantizationConfig):
     def __init__(self, quant_config: dict[str, Any] | None = None):
         super().__init__()
         self.quant_description = quant_config if quant_config is not None else {}
+        self._format_metadata: dict[str, Any] = {}
         self._apply_extra_quant_adaptations()
         self.model_type: str | None = None
         self.hf_to_vllm_mapper: WeightsMapper | None = None
@@ -550,6 +551,12 @@ class AscendModelSlimConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "AscendModelSlimConfig":
+        # Format-only HF metadata is not a per-parameter quantization description.
+        metadata_keys = {"quant_method", "model_quant_type"}
+        if config.get("quant_method") == ASCEND_QUANTIZATION_METHOD and set(config) <= metadata_keys:
+            result = cls()
+            result._format_metadata = dict(config)
+            return result
         return cls(config)
 
     @classmethod
@@ -870,7 +877,7 @@ class AscendModelSlimConfig(QuantizationConfig):
 
         if config_path is not None:
             with open(config_path) as f:
-                self.quant_description = json.load(f)
+                self.quant_description = {**self._format_metadata, **json.load(f)}
             self._apply_extra_quant_adaptations()
             self._add_kvcache_quant_metadata()
             return

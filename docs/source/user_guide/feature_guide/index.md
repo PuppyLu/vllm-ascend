@@ -9,6 +9,7 @@ graph_mode
 cpu_binding
 Ai_QoS_introduction_en
 quantization
+zercmoe
 sleep_mode
 structured_output
 lora

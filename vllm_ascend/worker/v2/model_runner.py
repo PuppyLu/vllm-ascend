@@ -158,13 +158,23 @@ class NPUModelRunner(GPUModelRunner):
         necessary HCCL buffer for the MC2 operator before standard `profile_run`. Additionally, we set
         override_mrv2_in_profile_run to True to force moe load to be balanced when executing `profile_run`
         """
+        # The wheel allocates >=18 GB outside PyTorch's allocator. Keep this
+        # inside memory_profiling and before KV sizing, even for short batches.
+        from vllm_ascend.ascend_forward_context import use_cann_zercmoe
+        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+        if get_ascend_device_type() == AscendDeviceType.A3 and use_cann_zercmoe(self.vllm_config):
+            from vllm_ascend.ops.fused_moe.moe_comm_method import initialize_zercmoe_buffer
+
+            initialize_zercmoe_buffer()
+
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         with override_mrv2_in_profile_run(True):
             if (
                 mc2_tokens_capacity is not None
                 and self.max_num_tokens > mc2_tokens_capacity
                 and select_moe_comm_method(mc2_tokens_capacity, self.vllm_config)
-                in {MoECommType.MC2, MoECommType.FUSED_MC2}
+                in {MoECommType.MC2, MoECommType.FUSED_MC2, MoECommType.ZERC_MOE}
             ):
                 # Use a call-scoped bypass because skip_compiled would require runner-specific ForwardContext plumbing.
                 with disable_compilation(self.get_model()):

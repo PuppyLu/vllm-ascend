@@ -19,6 +19,8 @@
 import torch
 from vllm.config import VllmConfig
 
+from vllm_ascend.worker.v2.spec_decode.forward_config import create_draft_forward_config
+
 
 def init_speculator(
     vllm_config: VllmConfig,
@@ -29,6 +31,9 @@ def init_speculator(
     """
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
+    # Every supported speculator stores this view for all draft forwards.
+    # Keep the target worker config and its additional_config untouched.
+    vllm_config = create_draft_forward_config(vllm_config)
     if speculative_config.use_dspark():
         from vllm_ascend.worker.v2.spec_decode.dspark.speculator import (
             AscendDSparkSpeculator,

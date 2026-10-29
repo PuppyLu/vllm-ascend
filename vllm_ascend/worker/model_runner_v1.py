@@ -2121,6 +2121,7 @@ class NPUModelRunner(GPUModelRunner):
             set_ascend_forward_context(
                 attn_metadata,
                 self.vllm_config,
+                request_forward=True,
                 num_tokens=num_tokens_padded,
                 num_tokens_across_dp=num_tokens_across_dp,
                 aclgraph_runtime_mode=cudagraph_mode,
@@ -2791,9 +2792,20 @@ class NPUModelRunner(GPUModelRunner):
     ) -> tuple[CUDAGraphMode, BatchDescriptor, bool, torch.Tensor | None, CUDAGraphStat | None]:
         num_tokens_padded = self._pad_for_sequence_parallelism(num_tokens)
         is_all_decode = np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] > 0)
+        zerc_decode_graph = (
+            getattr(getattr(self, "ascend_config", None), "enable_zerc_moe", 0) == 1
+            and get_ascend_device_type() == AscendDeviceType.A3
+            and getattr(self.vllm_config.compilation_config, "cudagraph_mode", None) == CUDAGraphMode.FULL_DECODE_ONLY
+        )
+        if zerc_decode_graph:
+            # A later chunk of prefill may also schedule exactly one token.
+            # Only requests whose prompt is already consumed use decode graph.
+            is_all_decode = np.all(
+                self.input_batch.num_computed_tokens_cpu[:num_reqs] >= self.input_batch.num_prompt_tokens[:num_reqs]
+            )
         uniform_decode = (
             (
-                (is_all_decode if self.speculative_config else True)
+                (is_all_decode if self.speculative_config or zerc_decode_graph else True)
                 and (max_num_scheduled_tokens == self.uniform_decode_query_len)
                 and (num_tokens == max_num_scheduled_tokens * num_reqs)
             )
@@ -3573,6 +3585,17 @@ class NPUModelRunner(GPUModelRunner):
         return output
 
     def profile_run(self) -> None:
+        # The wheel allocates >=18 GB outside PyTorch's allocator. Keep this
+        # inside memory_profiling and before KV sizing, even for short batches.
+        from vllm_ascend.ascend_forward_context import use_cann_zercmoe
+        from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
+
+        zercmoe_active = get_ascend_device_type() == AscendDeviceType.A3 and use_cann_zercmoe(self.vllm_config)
+        if zercmoe_active:
+            from vllm_ascend.ops.fused_moe.moe_comm_method import initialize_zercmoe_buffer
+
+            initialize_zercmoe_buffer()
+
         self.eplb_warmup()
         if self.sparse_kv_offload_enabled:
             allocate_kv_offload_topk_profile_buffers(
@@ -3581,10 +3604,31 @@ class NPUModelRunner(GPUModelRunner):
                 self.sparse_kv_offload_config,
             )
 
+        if (
+            zercmoe_active
+            and not getattr(getattr(self.vllm_config, "model_config", None), "enforce_eager", False)
+            and getattr(getattr(self.vllm_config, "compilation_config", None), "cudagraph_mode", None)
+            == CUDAGraphMode.FULL_DECODE_ONLY
+        ):
+            from vllm_ascend.ops.fused_moe.moe_comm_method import initialize_zercmoe_padding_ids
+
+            # Warm up the largest scheduler input before graph capture and KV
+            # sizing. The wheel owns its workspace, so its pointer lifetime
+            # still requires validation across all subsequent shapes.
+            initialize_zercmoe_padding_ids()
+            with disable_compilation(self.get_model()):
+                self._dummy_run(
+                    self.max_num_tokens,
+                    with_prefill=True,
+                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                    is_profile=True,
+                )
+            torch.npu.synchronize()
+
         mc2_tokens_capacity = get_mc2_tokens_capacity()
         if self.max_num_tokens > mc2_tokens_capacity and select_moe_comm_method(
             mc2_tokens_capacity, self.vllm_config
-        ) in {MoECommType.MC2, MoECommType.FUSED_MC2}:
+        ) in {MoECommType.MC2, MoECommType.FUSED_MC2, MoECommType.ZERC_MOE}:
             # Use a call-scoped bypass because skip_compiled would require runner-specific ForwardContext plumbing.
             with disable_compilation(self.get_model()):
                 self._dummy_run(mc2_tokens_capacity, with_prefill=True, is_profile=True)
@@ -3640,7 +3684,12 @@ class NPUModelRunner(GPUModelRunner):
                 if self.vllm_config.quant_config is not None:
                     patch_load_weights(self.vllm_config)
                 with get_tp_context(self.drafter):
-                    self.drafter.load_model(self.model)
+                    if getattr(get_ascend_config(), "zercmoe_single_weight", False) is True:
+                        from vllm_ascend.zercmoe_config import load_zercmoe_draft_model
+
+                        load_zercmoe_draft_model(self.drafter, self.model)
+                    else:
+                        self.drafter.load_model(self.model)
 
             set_moe_quant_mismatch(
                 self.model,

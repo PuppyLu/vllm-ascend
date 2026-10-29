@@ -18,6 +18,7 @@ import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import torch
 from vllm.config import KVTransferConfig, VllmConfig
 
 from tests.ut.base import TestBase
@@ -28,8 +29,9 @@ from vllm_ascend.ascend_config import (
     clear_ascend_config,
     get_ascend_config,
     init_ascend_config,
+    is_zercmoe_a3_supported_by_config,
 )
-from vllm_ascend.utils import clear_enable_sp, enable_sp, shared_expert_dp_enabled
+from vllm_ascend.utils import AscendDeviceType, clear_enable_sp, enable_sp, shared_expert_dp_enabled
 
 
 class TestAscendConfig(TestBase):
@@ -105,7 +107,11 @@ class TestAscendConfig(TestBase):
     def test_init_ascend_config_without_additional_config(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         # No additional config given, check the default value here.
-        ascend_config = init_ascend_config(test_vllm_config)
+        with patch.dict(os.environ):
+            os.environ.pop("VLLM_ASCEND_ENABLE_ZERC_MOE", None)
+            ascend_config = init_ascend_config(test_vllm_config)
+        self.assertEqual(ascend_config.enable_zerc_moe, 0)
+        self.assertIsNone(ascend_config.zercmoe_max_recv_token_num)
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
         self.assertEqual(ascend_config.mega_moe_max_tokens, 65536)
@@ -149,6 +155,45 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_zercmoe_single_weight_preserves_shared_overlap_only_on_a3(self, mock_fix_incompatible_config):
+        for device, enabled, expected in (
+            (AscendDeviceType.A3, 1, True),
+            (AscendDeviceType.A3, 0, False),
+            (AscendDeviceType.A2, 1, False),
+        ):
+            clear_ascend_config()
+            config = VllmConfig()
+            config.model_config = self._make_model_config()
+            config.model_config.dtype = torch.bfloat16
+            config.model_config.is_quantized = True
+            config.model_config.hf_text_config = SimpleNamespace(
+                hidden_size=6144, moe_intermediate_size=2048, n_routed_experts=256
+            )
+            config.additional_config = {
+                "enable_fused_mc2": 1,
+                "enable_zerc_moe": enabled,
+                "multistream_overlap_shared_expert": True,
+            }
+            with (
+                self.subTest(device=device, enabled=enabled),
+                patch("vllm_ascend.utils.get_ascend_device_type", return_value=device),
+            ):
+                ascend_config = init_ascend_config(config)
+                assert ascend_config.zercmoe_single_weight is expected
+                assert ascend_config.multistream_overlap_shared_expert is expected
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_removed_zercmoe_single_weight_option_is_rejected(self, mock_fix_incompatible_config):
+        for value in (True, False):
+            clear_ascend_config()
+            config = VllmConfig()
+            config.additional_config = {"zercmoe_single_weight": value}
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "has been removed"):
+                init_ascend_config(config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_init_ascend_config_validates_mega_moe_max_tokens(self, mock_fix_incompatible_config):
         invalid_values = ["65536", 0, -1]
 
@@ -162,6 +207,87 @@ class TestAscendConfig(TestBase):
                 self.assertRaisesRegex(ValueError, "mega_moe_max_tokens must be"),
             ):
                 init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_preserves_retired_capacity_for_p_worker_validation(self, mock_fix_incompatible_config):
+        # It is rejected by A3 eligibility, rather than during D-node setup.
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {"zercmoe_max_recv_token_num": 8192}
+        with patch("vllm_ascend.ascend_config.AscendConfig._fix_incompatible_config"):
+            config = AscendConfig(test_vllm_config)
+        self.assertEqual(config.zercmoe_max_recv_token_num, 8192)
+
+    def test_zercmoe_a3_shape_gate_follows_internal_wheel_alignment(self):
+        cases = [
+            (32, 32, 1, True),
+            (6144, 4096, 256, True),
+            (9824, 4096, 1024, True),
+            (9856, 4096, 256, True),
+            (6144, 4128, 256, True),
+            (6160, 4096, 256, True),
+            (6144, 4080, 256, True),
+            (6144, 4088, 256, False),
+            (6168, 4096, 256, False),
+            (0, 4096, 256, False),
+            (6144, 0, 256, False),
+            (6144, 4096, 0, False),
+            (6144, 4096, 1025, True),
+        ]
+        for hidden, intermediate, experts, expected in cases:
+            config = SimpleNamespace(
+                model_config=SimpleNamespace(
+                    hf_text_config=SimpleNamespace(
+                        hidden_size=hidden, moe_intermediate_size=intermediate, n_routed_experts=experts
+                    )
+                )
+            )
+            with self.subTest(hidden=hidden, intermediate=intermediate, experts=experts):
+                self.assertIs(is_zercmoe_a3_supported_by_config(config), expected)
+
+    def test_zercmoe_a3_shape_gate_uses_resolved_model_dimensions(self):
+        hf_config = SimpleNamespace(moe_intermediate_size=4096)
+        config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                hf_text_config=hf_config, get_hidden_size=lambda: 6144, get_num_experts=lambda: 256
+            )
+        )
+        self.assertTrue(is_zercmoe_a3_supported_by_config(config))
+        del hf_config.moe_intermediate_size
+        self.assertFalse(is_zercmoe_a3_supported_by_config(config))
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.ascend_config._CANN_OPS_TRANSFORMER_AVAILABLE", True)
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_zercmoe_shape_exemption_is_legacy_a2_only(self, mock_fix_incompatible_config):
+        cases = [
+            (AscendDeviceType.A3, True, torch.bfloat16, 6144, 4096, 256, 1, 0),
+            (AscendDeviceType.A3, True, torch.float16, 6144, 4096, 256, 1, 0),
+            (AscendDeviceType.A3, False, torch.bfloat16, 6144, 4096, 256, 1, 0),
+            (AscendDeviceType.A3, True, torch.bfloat16, 9856, 4096, 256, 1, 0),
+            (AscendDeviceType.A3, True, torch.bfloat16, 6144, 4128, 256, 1, 0),
+            (AscendDeviceType.A3, True, torch.bfloat16, 6144, 4096, 1025, 1, 0),
+            (AscendDeviceType.A3, True, torch.bfloat16, 6144, 4096, 256, 0, 0),
+            (AscendDeviceType.A2, False, torch.bfloat16, 2064, 528, 256, 1, 1),
+            (AscendDeviceType.A2, True, torch.bfloat16, 2064, 528, 256, 1, 0),
+            (AscendDeviceType.A2, False, torch.float16, 2064, 528, 256, 1, 0),
+        ]
+        for device, quantized, dtype, hidden, intermediate, experts, enabled, expected in cases:
+            clear_ascend_config()
+            test_vllm_config = VllmConfig()
+            test_vllm_config.model_config = self._make_model_config()
+            test_vllm_config.model_config.dtype = dtype
+            test_vllm_config.model_config.is_quantized = quantized
+            test_vllm_config.model_config.hf_text_config = SimpleNamespace(
+                hidden_size=hidden, moe_intermediate_size=intermediate, n_routed_experts=experts
+            )
+            test_vllm_config.additional_config = {"enable_fused_mc2": 1, "enable_zerc_moe": enabled}
+            with (
+                self.subTest(device=device, quantized=quantized, dtype=dtype, hidden=hidden, intermediate=intermediate),
+                patch("vllm_ascend.utils.get_ascend_device_type", return_value=device),
+            ):
+                config = init_ascend_config(test_vllm_config)
+                self.assertEqual(config.enable_fused_mc2, expected)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

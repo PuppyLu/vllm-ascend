@@ -1192,6 +1192,14 @@ def should_skip_allreduce_across_dp_group(vllm_config: VllmConfig, is_draft_mode
     if not is_context_moe_model:
         return True
 
+    # A later, smaller batch may use Zerc even if the maximum-token probe
+    # selects MC2. All DP ranks must still agree on graph mode and padding.
+    if not is_draft_model and getattr(ascend_config, "enable_zerc_moe", 0) == 1:
+        from vllm_ascend.ascend_forward_context import is_zercmoe_active_by_config
+
+        if get_ascend_device_type() == AscendDeviceType.A3 and is_zercmoe_active_by_config(vllm_config):
+            return False
+
     # Only applicable to MoE models on KV consumer ranks.
     is_kv_consumer = vllm_config.kv_transfer_config is not None and vllm_config.kv_transfer_config.is_kv_consumer
     if not is_kv_consumer:
@@ -1205,7 +1213,9 @@ def should_skip_allreduce_across_dp_group(vllm_config: VllmConfig, is_draft_mode
 
     scheduler_config = vllm_config.scheduler_config
     # potential_max_tokens is read from the set/get global (computed once in init).
-    decode_comm_method = select_moe_comm_method(get_potential_max_tokens(), vllm_config, is_draft_model=is_draft_model)
+    decode_comm_method = select_moe_comm_method(
+        get_potential_max_tokens(), vllm_config, is_draft_model=is_draft_model, is_decode=True
+    )
     # For prefill, use the scheduler's max_num_batched_tokens for a single batch.
     prefill_comm_method = select_moe_comm_method(
         scheduler_config.max_num_batched_tokens, vllm_config, is_draft_model=is_draft_model

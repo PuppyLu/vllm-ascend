@@ -26,8 +26,7 @@ import torch.distributed as dist
 from cross_rank_prototype.staged_collectives import _agree
 from mc2_integration.stage24_admission import NATIVE_SHARED_PROTOCOL, IndependentIdentity, ReviewedIndependentAbi
 from mc2_integration.torch_acl_bridge import ATTR_NAMES, _check_tensor, aligned_copy
-from mc2_integration.vllm_mc2_bridge import Mc2SessionConfig, MegaKernelDecodeSession
-from mc2_integration.vllm_mc2_repeatable import RepeatableMegaKernelSession
+from mc2_integration.vllm_mc2_bridge import Mc2SessionConfig
 
 from vllm_ascend.models.glm5next.mega_kernel_adapter import (
     DecodeLayerAdapter,
@@ -37,6 +36,7 @@ from vllm_ascend.models.glm5next.mega_kernel_adapter import (
     validate_model_path_config,
 )
 from vllm_ascend.models.glm5next.mega_kernel_scheduler import V2SchedulerEvidence
+from vllm_ascend.models.glm5next.mega_kernel_torch_session import create_torch_session
 from vllm_ascend.models.glm5next.mega_kernel_weights import map_static_weights
 
 _gate = None
@@ -320,11 +320,10 @@ def bootstrap(runner: Any, config_path: str):
                 native_shared=True,
                 consumer_readback=False,
             )
-            base_session = MegaKernelDecodeSession(sc)
             # A process-lifetime epoch is valid only under the explicit no-refit
             # and no-group-replacement contract checked during startup.
             epoch = manifest["model_digest"] + ":" + str(layer.layer_idx)
-            session = RepeatableMegaKernelSession(base_session, lambda epoch=epoch: epoch)
+            session = create_torch_session(sc, lambda epoch=epoch: epoch)
         except Exception as exc:
             local_error = exc
         if not _all_true(local_error is None, device, control):

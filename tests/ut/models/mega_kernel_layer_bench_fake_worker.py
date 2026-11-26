@@ -109,6 +109,7 @@ layer = N(
     self_attn=N(kv_cache=(torch.zeros(3, 3, 4), torch.zeros(3, 1, 2, 2)), _conv_state_dim_first=False),
     mlp=N(experts=N(routed_experts=routed)),
     _megakernel_stats={"hits": 0},
+    _megakernel_session=N(last_route_weights=None, last_route_ids=None),
 )
 
 
@@ -121,6 +122,8 @@ def actual(positions, hidden, residual, post, comb):
 
 def fused(*args):
     result = actual(*args)
+    layer._megakernel_session.last_route_weights = torch.full((2, 8), 0.125)
+    layer._megakernel_session.last_route_ids = torch.arange(8, dtype=torch.int32).repeat(2, 1)
     layer._megakernel_stats["hits"] += 1
     return result
 
@@ -148,6 +151,38 @@ assert result["status"] == "PAIRED_LIVE_LAYER_PASS" and result["summary"]["speed
 assert all(torch.equal(t, x) for t, x in zip(layer.self_attn.kv_cache, before))
 assert "_select_experts" not in routed.__dict__
 print("CPU protocol smoke: passed; no A3 or model test")
+
+
+def internal_fused(positions, hidden, residual, post, comb):
+    # Internal routing does not call the model's _select_experts. Its real
+    # device outputs, not a reconstructed reference route, must be compared.
+    layer._megakernel_session.last_route_weights = torch.full((2, 8), 0.125)
+    layer._megakernel_session.last_route_ids = torch.arange(8, dtype=torch.int32).repeat(2, 1)
+    layer.self_attn.kv_cache[0][0] += 1
+    layer.self_attn.kv_cache[1][1] += 2
+    layer._megakernel_stats["hits"] += 1
+    return (hidden.clone(), None, None, None)
+
+
+layer._megakernel_session = N(last_route_weights=None, last_route_ids=None)
+layer._megakernel_benchmark_forward = internal_fused
+result = m.measure(
+    layer,
+    torch.tensor([1, 2]),
+    torch.ones(2, 4),
+    None,
+    None,
+    None,
+    control_group=N(),
+    control_device="cpu",
+    consumer_ready=lambda mode, out: None,
+    events_join_required_work=True,
+    logical_step_agreed=True,
+    expected_rows=2,
+    warmup=0,
+    samples=1,
+)
+assert result["status"] == "PAIRED_LIVE_LAYER_PASS"
 
 
 def bad_fused(*args):

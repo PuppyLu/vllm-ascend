@@ -310,6 +310,7 @@ class DecodeLayerAdapter:
                 execution_lock.release()
 
         layer._megakernel_original_forward = original
+        layer._megakernel_session = getattr(adapter.backend, "session", None)
         # The diagnostic replay runs synchronously inside the already-held
         # layer lock; only that private path may call the implementation.
         layer._megakernel_benchmark_forward = types.MethodType(forward_impl, layer)
@@ -410,6 +411,37 @@ def _copy_live_kda_slots(cache: Any, state_indices: Any) -> tuple[Any, Any]:
     return result[0], result[1]
 
 
+def _validate_internal_router(layer: Any, router: Any) -> None:
+    """Reject model routing features that the MC2 internal router cannot implement."""
+    routed = layer.mlp.experts.routed_experts
+    if router is None or type(router).__name__ not in ("AscendFusedTopKRouter", "AscendGroupedTopKRouter"):
+        raise UnsupportedDecode("MC2 internal routing requires a known Ascend top-k router")
+    if type(router).__name__ == "AscendGroupedTopKRouter" and getattr(router, "use_grouped_topk", None) is not True:
+        raise UnsupportedDecode("ungrouped native router uses different correction-bias weight semantics")
+    if (
+        getattr(router, "top_k", None) != 8
+        or getattr(router, "scoring_func", None) != "sigmoid"
+        or getattr(router, "renormalize", None) is not True
+        or getattr(router, "routed_scaling_factor", None) != 2.5
+        or getattr(router, "num_expert_group", None) not in (None, 1)
+        or getattr(router, "topk_group", None) not in (None, 1)
+    ):
+        raise UnsupportedDecode("model router configuration differs from MC2 sigmoid top-8 contract")
+    if any(
+        getattr(router, field, None) is not None
+        for field in ("eplb_state", "custom_routing_function", "tid2eid", "bias_vl")
+    ):
+        raise UnsupportedDecode("MC2 internal routing does not implement custom routing or EPLB")
+    if getattr(routed, "log2phy", None) is not None or getattr(routed, "mix_placement", False):
+        raise UnsupportedDecode("MC2 internal routing does not implement expert remapping or mixed placement")
+    if getattr(router, "num_fused_shared_experts", 0):
+        raise UnsupportedDecode("MC2 internal routing does not append shared expert IDs")
+    if getattr(router, "e_score_correction_bias", None) is not getattr(layer.mlp.gate, "e_score_correction_bias", None):
+        raise UnsupportedDecode("MC2 internal routing requires the model gate correction bias")
+    if getattr(layer.mlp.gate, "e_score_correction_bias", None) is None:
+        raise UnsupportedDecode("MC2 internal routing requires a correction bias")
+
+
 class MegaKernelModelBackend:
     """Assemble real model tensors and invoke a group-bound MC2 session.
 
@@ -420,12 +452,21 @@ class MegaKernelModelBackend:
     """
 
     def __init__(
-        self, session: Any, static_weights: dict[str, Any], attrs: dict[str, Any], identity_factory: Callable[..., Any]
+        self,
+        session: Any,
+        static_weights: dict[str, Any],
+        attrs: dict[str, Any],
+        identity_factory: Callable[..., Any],
+        *,
+        routing_mode: str = "external",
     ):
         if not callable(getattr(session, "forward", None)) or not callable(identity_factory):
             raise TypeError("MC2 session and model identity factory are required")
+        if routing_mode not in ("external", "internal"):
+            raise ValueError("routing_mode must be external or internal")
         self.session, self.static_weights, self.attrs = session, dict(static_weights), dict(attrs)
         self.identity_factory = identity_factory
+        self.routing_mode = routing_mode
 
     def validate(
         self, layer: Any, decode: DecodeInputs, hidden_states: Any, residual: Any, post: Any, comb: Any
@@ -460,6 +501,12 @@ class MegaKernelModelBackend:
         router = getattr(routed, "router", None)
         if getattr(router, "routed_scaling_factor", None) != getattr(layer.mlp, "routed_scaling_factor", None):
             raise UnsupportedDecode("vLLM routed scale is not fully included in external routing weights")
+        if self.routing_mode == "internal":
+            from vllm_ascend.ascend_config import get_ascend_config
+
+            if getattr(get_ascend_config(), "enable_force_eplb", False):
+                raise UnsupportedDecode("MC2 internal routing does not support forced expert load balancing")
+            _validate_internal_router(layer, router)
         routed_cfg = getattr(routed, "moe_config", None)
         if (
             getattr(layer.mlp.shared_experts, "swiglu_limit", None) != 10.0
@@ -480,7 +527,11 @@ class MegaKernelModelBackend:
         try:
             # Allocate everything that can fail locally before the reference
             # prefix enters the real TP collective.
-            temporary_cache = _copy_live_kda_slots(layer.self_attn.kv_cache, decode.state_indices)
+            temporary_cache = (
+                _copy_live_kda_slots(layer.self_attn.kv_cache, decode.state_indices)
+                if self.routing_mode == "external"
+                else None
+            )
             padded_post = aligned_empty((rows, 128), torch.float32, hidden_states.device)
             padded_comb = aligned_empty((rows, 128), torch.float32, hidden_states.device)
             padded_post.zero_()
@@ -530,15 +581,18 @@ class MegaKernelModelBackend:
             raise error
         error = None
         try:
-            ids, weights = compute_model_routes(
-                layer, positions, hidden_states, residual, post, comb, temporary_cache=temporary_cache
-            )
-            inputs.update(external_route_ids=aligned_copy(ids), external_route_weights=aligned_copy(weights))
+            if self.routing_mode == "external":
+                ids, weights = compute_model_routes(
+                    layer, positions, hidden_states, residual, post, comb, temporary_cache=temporary_cache
+                )
+                inputs.update(external_route_ids=aligned_copy(ids), external_route_weights=aligned_copy(weights))
         except Exception as exc:
             # A failure inside an already-entered TP collective requires the
             # distributed job watchdog, not local rollback or retry.
             error = exc
-        _agree(error, self.session.config.control_device, self.session.config.control_group, "model external routing")
+        _agree(
+            error, self.session.config.control_device, self.session.config.control_group, "model routing preparation"
+        )
         if error is not None:
             raise error
         result = self.session.forward(inputs, self.attrs, identity)

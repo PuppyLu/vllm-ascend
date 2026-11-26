@@ -185,6 +185,92 @@ class DecodeMetadataTests(unittest.TestCase):
         self.assertEqual(ids.dtype, torch.int32)
         self.assertEqual(weights.dtype, torch.float32)
 
+    def test_internal_router_contract_rejects_incompatible_model(self):
+        bias = torch.zeros(288)
+        router = type("AscendFusedTopKRouter", (), {})()
+        router.top_k = 8
+        router.scoring_func = "sigmoid"
+        router.renormalize = True
+        router.routed_scaling_factor = 2.5
+        router.num_expert_group = 1
+        router.topk_group = 1
+        router.e_score_correction_bias = bias
+        routed = NS(router=router, log2phy=None, mix_placement=False)
+        layer = NS(mlp=NS(experts=NS(routed_experts=routed), gate=NS(e_score_correction_bias=bias)))
+        module._validate_internal_router(layer, router)
+        for obj, field, value in (
+            (router, "top_k", 4),
+            (router, "num_expert_group", 2),
+            (router, "routed_scaling_factor", 1.0),
+            (router, "eplb_state", object()),
+            (router, "custom_routing_function", lambda: None),
+            (router, "e_score_correction_bias", torch.zeros(288)),
+            (routed, "log2phy", torch.arange(288)),
+            (routed, "mix_placement", True),
+        ):
+            previous = getattr(obj, field, None)
+            setattr(obj, field, value)
+            with self.assertRaises(UnsupportedDecode, msg=field):
+                module._validate_internal_router(layer, router)
+            setattr(obj, field, previous)
+        grouped = type("AscendGroupedTopKRouter", (), {})()
+        grouped.__dict__.update(router.__dict__)
+        grouped.use_grouped_topk = False
+        with self.assertRaises(UnsupportedDecode):
+            module._validate_internal_router(layer, grouped)
+        grouped.use_grouped_topk = True
+        module._validate_internal_router(layer, grouped)
+
+    def test_internal_routing_skips_reference_prefix_and_passes_no_external_routes(self):
+        names = (
+            "x",
+            "post_h_out",
+            "post_h_post",
+            "post_h_res",
+            "conv_state",
+            "recurrent_state",
+            "cu_seqlens",
+            "state_indices",
+            "external_route_ids",
+            "external_route_weights",
+            "static",
+        )
+        projection = ModuleType("mc2_integration.projection_contract")
+        projection.MC2_INPUT_NAMES = names
+        bridge = ModuleType("mc2_integration.torch_acl_bridge")
+        bridge._check_tensor = lambda *a: None
+        bridge.aligned_copy = lambda value: value.clone()
+        bridge.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
+        collectives = ModuleType("cross_rank_prototype.staged_collectives")
+        collectives._agree = lambda error, *a: None
+        seen = {}
+
+        def forward(inputs, attrs, identity):
+            seen.update(inputs)
+            return (self.hidden, self.residual, self.post, self.comb)
+
+        session = NS(forward=forward, config=NS(control_device="cpu", control_group=None))
+        backend = module.MegaKernelModelBackend(
+            session, {"static": 1}, {}, lambda *a: "identity", routing_mode="internal"
+        )
+        decode = self.prepare()
+        fake_npu = NS(current_stream=lambda device: NS(synchronize=lambda: None))
+        modules = {
+            "mc2_integration.projection_contract": projection,
+            "mc2_integration.torch_acl_bridge": bridge,
+            "cross_rank_prototype.staged_collectives": collectives,
+        }
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(torch, "npu", fake_npu, create=True),
+            patch.object(module, "compute_model_routes", side_effect=AssertionError("repeated prefix")),
+            patch.object(module, "_copy_live_kda_slots", side_effect=AssertionError("temporary cache")),
+        ):
+            result = backend(self.layer, None, self.hidden, self.residual, self.post, self.comb, decode)
+        self.assertEqual(len(result), 4)
+        self.assertIsNone(seen["external_route_ids"])
+        self.assertIsNone(seen["external_route_weights"])
+
     def test_reject_nonuniform_tokens_and_duplicate_slots(self):
         self.meta.non_spec_query_start_loc = torch.tensor([0, 0, 2])
         with self.assertRaises(UnsupportedDecode):

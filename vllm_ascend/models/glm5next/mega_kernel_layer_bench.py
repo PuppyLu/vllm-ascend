@@ -303,6 +303,13 @@ def measure(
                     _clone(conv.index_select(0, active_indices[:, 0].to(conv.device))),
                     _clone(work[1].index_select(0, active_indices[:, 1].to(work[1].device))),
                 )
+                if capture and mode == "fused":
+                    session = getattr(layer, "_megakernel_session", None)
+                    weights = getattr(session, "last_route_weights", None)
+                    ids = getattr(session, "last_route_ids", None)
+                    if not isinstance(weights, torch.Tensor) or not isinstance(ids, torch.Tensor):
+                        raise ValueError("MC2 did not expose its actual routing outputs")
+                    routes = [(weights, ids)]
                 routed = [(_clone(w), _clone(i)) for w, i in routes]
                 original_indices = None
                 if capture and mode == "original" and len(routed) == 1:

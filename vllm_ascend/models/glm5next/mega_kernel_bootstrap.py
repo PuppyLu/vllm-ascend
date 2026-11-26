@@ -142,7 +142,8 @@ def bootstrap(runner: Any, config_path: str):
 
     JSON config: `manifest_path`, `opapi_path`, `generated_header_path`,
     `reviewed_generated_header: true`, `expert_postprocessed: true`,
-    `tp_algorithm`, `ep_algorithm`, optional `allow_nz: false`.
+    `tp_algorithm`, `ep_algorithm`, optional `allow_nz: false`, and
+    `routing_mode` (external by default; internal is an experimental fast path).
     Manifest schema `megakernel.model_manifest.v1`: `model_digest`,
     `generated_header_sha256`, `max_rows_per_source`, `max_total_rows`,
     `layers` keyed by layer_idx. Every layer contains `attrs`, ordered
@@ -163,6 +164,9 @@ def bootstrap(runner: Any, config_path: str):
     try:
         cfg_raw = Path(config_path).read_bytes()
         cfg = json.loads(cfg_raw)
+        routing_mode = cfg.get("routing_mode", "external")
+        if routing_mode not in ("external", "internal"):
+            raise ValueError("routing_mode must be external or internal")
         if cfg.get("reviewed_generated_header") is not True or cfg.get("expert_postprocessed") is not True:
             raise ValueError("explicit ABI review and expert post-load attestation required")
         if cfg.get("weights_and_groups_static_for_process") is not True:
@@ -330,7 +334,7 @@ def bootstrap(runner: Any, config_path: str):
                 raise RuntimeError("MC2 logical step has not been agreed across ranks")
             return IndependentIdentity(actual_layer.layer_idx, sequence[0], model_digest, digest)
 
-        backend = MegaKernelModelBackend(session, weights, item["attrs"], identity_factory)
+        backend = MegaKernelModelBackend(session, weights, item["attrs"], identity_factory, routing_mode=routing_mode)
 
         def coordinate(actual_layer, error):
             del actual_layer

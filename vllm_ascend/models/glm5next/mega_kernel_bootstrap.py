@@ -32,7 +32,7 @@ from mc2_integration.vllm_mc2_repeatable import RepeatableMegaKernelSession
 from vllm_ascend.models.glm5next.mega_kernel_adapter import (
     DecodeLayerAdapter,
     MegaKernelModelBackend,
-    UnsupportedDecode,
+    coordinate_layer_preflight,
 )
 from vllm_ascend.models.glm5next.mega_kernel_scheduler import V2SchedulerEvidence
 from vllm_ascend.models.glm5next.mega_kernel_weights import map_static_weights
@@ -340,13 +340,7 @@ def bootstrap(runner: Any, config_path: str):
             del actual_layer
             # Unexpected exceptions abort every rank; known unsupported input
             # permits a group-wide fallback before any MC2 collective.
-            _agree(
-                error if error is not None and not isinstance(error, UnsupportedDecode) else None,
-                device,
-                control,
-                "model adapter preflight",
-            )
-            return _all_true(error is None and _gate.is_pure_decode(), device, control)
+            return coordinate_layer_preflight(error, _gate.is_pure_decode(), device, control)
 
         def execution_mode():
             return _gate.execution_mode()

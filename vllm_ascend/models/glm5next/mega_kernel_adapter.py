@@ -27,6 +27,26 @@ class UnsupportedDecode(ValueError):
     """Before a collective launch, this layer must use the original path."""
 
 
+def coordinate_layer_preflight(error: Exception | None, pure_decode: bool, device: Any, group: Any) -> bool:
+    """Agree on accept, fallback, or abort in one group reduction."""
+    import torch
+    import torch.distributed as dist
+    from cross_rank_prototype.staged_collectives import CollectiveProtocolError
+
+    status = (
+        2
+        if error is not None and not isinstance(error, UnsupportedDecode)
+        else int(error is not None or not pure_decode)
+    )
+    decision = torch.tensor([status], dtype=torch.int32, device=device)
+    dist.all_reduce(decision, op=dist.ReduceOp.MAX, group=group)
+    result = int(decision.item())
+    if result == 2:
+        cause = error if not isinstance(error, UnsupportedDecode) else None
+        raise CollectiveProtocolError("model adapter preflight failed on at least one rank; abort job") from cause
+    return result == 0
+
+
 @dataclass(frozen=True)
 class DecodeInputs:
     metadata: Any
@@ -167,14 +187,18 @@ def prepare_decode_inputs(
         conv_state = conv_state.contiguous()
     if not recurrent_state.is_contiguous():
         raise UnsupportedDecode("recurrent state layout is not MC2 contiguous")
-    for name, slots, capacity in (
-        ("conv", conv_slots, conv_state.shape[0]),
-        ("recurrent", recurrent_slots, recurrent_state.shape[0]),
+    # One host transfer retains the full signed width of both model slot
+    # tensors; converting to the ABI's int32 before validation could wrap.
+    slot_pairs = torch.stack((conv_slots.to(torch.int64), recurrent_slots.to(torch.int64)), dim=1)
+    host_pairs = slot_pairs.detach().cpu().tolist()
+    for column, name, capacity in (
+        (0, "conv", conv_state.shape[0]),
+        (1, "recurrent", recurrent_state.shape[0]),
     ):
-        vals = slots.detach().cpu().tolist()
+        vals = [pair[column] for pair in host_pairs]
         if any(v < 0 or v >= capacity for v in vals) or len(set(vals)) != rows:
             raise UnsupportedDecode(f"{name} slots contain padding, invalid or duplicate state")
-    indices = torch.stack((conv_slots, recurrent_slots), dim=1).to(dtype=torch.int32).contiguous()
+    indices = slot_pairs.to(dtype=torch.int32).contiguous()
     # This MC2 ABI takes a single-token template, not the cumulative query offsets.
     cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device=hidden_states.device)
     return DecodeInputs(metadata, conv_state, conv_writeback, recurrent_state, indices, cu_seqlens, rows)
@@ -579,22 +603,25 @@ class MegaKernelModelBackend:
         _agree(error, self.session.config.control_device, self.session.config.control_group, "model route preparation")
         if error is not None:
             raise error
-        error = None
-        try:
-            if self.routing_mode == "external":
+        if self.routing_mode == "external":
+            error = None
+            try:
                 ids, weights = compute_model_routes(
                     layer, positions, hidden_states, residual, post, comb, temporary_cache=temporary_cache
                 )
                 inputs.update(external_route_ids=aligned_copy(ids), external_route_weights=aligned_copy(weights))
-        except Exception as exc:
-            # A failure inside an already-entered TP collective requires the
-            # distributed job watchdog, not local rollback or retry.
-            error = exc
-        _agree(
-            error, self.session.config.control_device, self.session.config.control_group, "model routing preparation"
-        )
-        if error is not None:
-            raise error
+            except Exception as exc:
+                # A failure inside an already-entered TP collective requires
+                # the distributed job watchdog, not local rollback or retry.
+                error = exc
+            _agree(
+                error,
+                self.session.config.control_device,
+                self.session.config.control_group,
+                "model routing preparation",
+            )
+            if error is not None:
+                raise error
         result = self.session.forward(inputs, self.attrs, identity)
         # Every rank enters the post-commit agreement, even when only some
         # layouts require a separate convolution-state copy.

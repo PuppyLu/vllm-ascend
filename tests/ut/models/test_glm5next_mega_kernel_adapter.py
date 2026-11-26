@@ -80,6 +80,17 @@ class DecodeMetadataTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(worker)], capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_group_preflight_in_two_gloo_processes(self):
+        worker = Path(__file__).with_name("mega_kernel_coordination_gloo_worker.py")
+        result = subprocess.run(
+            [sys.executable, str(worker)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_real_slot_columns_and_single_token_template(self):
         result = self.prepare()
         torch.testing.assert_close(result.state_indices, torch.tensor([[1, 2], [3, 0]], dtype=torch.int32))
@@ -242,7 +253,8 @@ class DecodeMetadataTests(unittest.TestCase):
         bridge.aligned_copy = lambda value: value.clone()
         bridge.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
         collectives = ModuleType("cross_rank_prototype.staged_collectives")
-        collectives._agree = lambda error, *a: None
+        votes = []
+        collectives._agree = lambda error, *a: votes.append(a[-1])
         seen = {}
 
         def forward(inputs, attrs, identity):
@@ -270,6 +282,24 @@ class DecodeMetadataTests(unittest.TestCase):
         self.assertEqual(len(result), 4)
         self.assertIsNone(seen["external_route_ids"])
         self.assertIsNone(seen["external_route_weights"])
+        self.assertEqual(votes, ["model route preparation", "model convolution state writeback"])
+        votes.clear()
+        external = module.MegaKernelModelBackend(session, {"static": 1}, {}, lambda *a: "identity")
+        ids = torch.arange(8, dtype=torch.int32).repeat(2, 1)
+        weights = torch.full((2, 8), 0.125)
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(torch, "npu", fake_npu, create=True),
+            patch.object(module, "compute_model_routes", return_value=(ids, weights)) as route,
+            patch.object(module, "_copy_live_kda_slots", return_value=(None, None)),
+        ):
+            external(self.layer, None, self.hidden, self.residual, self.post, self.comb, decode)
+        route.assert_called_once()
+        torch.testing.assert_close(seen["external_route_ids"], ids)
+        torch.testing.assert_close(seen["external_route_weights"], weights)
+        self.assertEqual(
+            votes, ["model route preparation", "model routing preparation", "model convolution state writeback"]
+        )
 
     def test_reject_nonuniform_tokens_and_duplicate_slots(self):
         self.meta.non_spec_query_start_loc = torch.tensor([0, 0, 2])
@@ -277,6 +307,11 @@ class DecodeMetadataTests(unittest.TestCase):
             self.prepare()
         self.meta.non_spec_query_start_loc = torch.tensor([0, 1, 2])
         self.conv_slots[1] = self.conv_slots[0]
+        with self.assertRaises(UnsupportedDecode):
+            self.prepare()
+
+    def test_slot_validation_preserves_int64_until_range_check(self):
+        self.meta.non_spec_state_indices_tensor = torch.tensor([2, 2**32], dtype=torch.int64)
         with self.assertRaises(UnsupportedDecode):
             self.prepare()
 

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import gc
 import importlib.util
 import subprocess
 import sys
@@ -97,6 +98,51 @@ class DecodeMetadataTests(unittest.TestCase):
         torch.testing.assert_close(result.cu_seqlens, torch.tensor([0, 1], dtype=torch.int32))
         self.assertIs(result.conv_state, self.layer.self_attn.kv_cache[0])
         self.assertIs(result.recurrent_state, self.layer.self_attn.kv_cache[1])
+
+    def test_integer_query_and_slot_values_share_one_host_read(self):
+        original_cpu = torch.Tensor.cpu
+        transfers = []
+
+        def read_to_cpu(tensor, *args, **kwargs):
+            transfers.append(tuple(tensor.shape))
+            return original_cpu(tensor, *args, **kwargs)
+
+        with patch.object(torch.Tensor, "cpu", read_to_cpu):
+            result = self.prepare()
+        self.assertEqual(transfers, [(7,)])
+        torch.testing.assert_close(result.state_indices, torch.tensor([[1, 2], [3, 0]], dtype=torch.int32))
+
+    def test_noninteger_query_keeps_original_exact_check(self):
+        self.meta.non_spec_query_start_loc = torch.tensor([0.0, 1.5, 2.0])
+        with self.assertRaises(UnsupportedDecode):
+            self.prepare()
+
+    def test_aligned_mhc_views_are_disjoint_and_survive_parent_release(self):
+        def aligned_empty(shape, dtype, device):
+            size = 1
+            for dim in shape:
+                size *= dim
+            element = torch.empty((), dtype=dtype).element_size()
+            storage = torch.empty(size + 1024 // element, dtype=dtype, device=device)
+            offset = (-storage.data_ptr()) % 512
+            return storage[offset // element : offset // element + size].view(shape)
+
+        for rows in (1, 3, 7, 32, 65):
+            post, comb = module._aligned_mhc_buffers(rows, torch.float32, "cpu", aligned_empty)
+            gc.collect()
+            self.assertEqual(comb.data_ptr() - post.data_ptr(), rows * 512)
+            for buffer in (post, comb):
+                self.assertTrue(buffer.is_contiguous())
+                self.assertFalse(buffer.requires_grad)
+                self.assertEqual(buffer.data_ptr() % 512, 0)
+                available = buffer.untyped_storage().nbytes() - buffer.storage_offset() * buffer.element_size()
+                required = ((buffer.numel() * buffer.element_size() + 31) // 32) * 32
+                self.assertGreaterEqual(available, required)
+                self.assertEqual(buffer.count_nonzero().item(), 0)
+            post.fill_(1)
+            self.assertEqual(comb.count_nonzero().item(), 0)
+            comb.fill_(2)
+            self.assertTrue(torch.all(post == 1))
 
     def test_reject_unproven_prefill_mixed_and_graph(self):
         with self.assertRaises(UnsupportedDecode):
@@ -283,6 +329,12 @@ class DecodeMetadataTests(unittest.TestCase):
         self.assertIsNone(seen["external_route_ids"])
         self.assertIsNone(seen["external_route_weights"])
         self.assertEqual(votes, ["model route preparation", "model convolution state writeback"])
+        post_pad, comb_pad = seen["post_h_post"], seen["post_h_res"]
+        self.assertEqual(comb_pad.data_ptr() - post_pad.data_ptr(), 2 * 128 * 4)
+        torch.testing.assert_close(post_pad[:, :4], self.post.reshape(2, 4))
+        torch.testing.assert_close(comb_pad[:, :16], self.comb.reshape(2, 16))
+        self.assertEqual(post_pad[:, 4:].count_nonzero().item(), 0)
+        self.assertEqual(comb_pad[:, 16:].count_nonzero().item(), 0)
         votes.clear()
         external = module.MegaKernelModelBackend(session, {"static": 1}, {}, lambda *a: "identity")
         ids = torch.arange(8, dtype=torch.int32).repeat(2, 1)

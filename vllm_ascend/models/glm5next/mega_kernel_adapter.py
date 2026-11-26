@@ -147,10 +147,14 @@ def prepare_decode_inputs(
     query = getattr(metadata, "non_spec_query_start_loc", None)
     if not isinstance(query, torch.Tensor) or query.ndim != 1 or query.numel() != rows + 1:
         raise UnsupportedDecode("decode query boundaries are missing or padded")
-    # Exact sequence boundaries preclude e.g. 0+2 token mixes with equal sums.
-    boundaries = query.detach().cpu().tolist()
-    if boundaries != list(range(rows + 1)):
-        raise UnsupportedDecode("not exactly one token for each request")
+    # Common device integer metadata can share one host read with the slots.
+    # Keep the old path for other devices/dtypes, so no conversion can turn
+    # a fractional or otherwise different boundary into a valid one.
+    packed_query = query.device == hidden_states.device and query.dtype in (torch.int32, torch.int64)
+    if not packed_query:
+        boundaries = query.detach().cpu().tolist()
+        if boundaries != list(range(rows + 1)):
+            raise UnsupportedDecode("not exactly one token for each request")
     conv_slots = _one_dim_slots(getattr(conv_meta, "cache_indices", None), rows, "conv slots", torch)
     recurrent_slots = _one_dim_slots(
         getattr(metadata, "non_spec_state_indices_tensor", None), rows, "recurrent slots", torch
@@ -190,7 +194,15 @@ def prepare_decode_inputs(
     # One host transfer retains the full signed width of both model slot
     # tensors; converting to the ABI's int32 before validation could wrap.
     slot_pairs = torch.stack((conv_slots.to(torch.int64), recurrent_slots.to(torch.int64)), dim=1)
-    host_pairs = slot_pairs.detach().cpu().tolist()
+    if packed_query:
+        packed = torch.cat((query.to(torch.int64), slot_pairs.reshape(-1)))
+        metadata_values = packed.detach().cpu().tolist()
+        if metadata_values[: rows + 1] != list(range(rows + 1)):
+            raise UnsupportedDecode("not exactly one token for each request")
+        flat_pairs = metadata_values[rows + 1 :]
+        host_pairs = list(zip(flat_pairs[::2], flat_pairs[1::2]))
+    else:
+        host_pairs = slot_pairs.detach().cpu().tolist()
     for column, name, capacity in (
         (0, "conv", conv_state.shape[0]),
         (1, "recurrent", recurrent_state.shape[0]),
@@ -435,6 +447,14 @@ def _copy_live_kda_slots(cache: Any, state_indices: Any) -> tuple[Any, Any]:
     return result[0], result[1]
 
 
+def _aligned_mhc_buffers(rows: int, dtype: Any, device: Any, aligned_empty: Callable[..., Any]) -> tuple[Any, Any]:
+    """Allocate disjoint, independently aligned post and combination buffers."""
+    # Each FP32 plane is rows * 512 bytes, so both views are aligned.
+    mixing = aligned_empty((2, rows, 128), dtype, device)
+    mixing.zero_()
+    return mixing[0], mixing[1]
+
+
 def _validate_internal_router(layer: Any, router: Any) -> None:
     """Reject model routing features that the MC2 internal router cannot implement."""
     routed = layer.mlp.experts.routed_experts
@@ -556,10 +576,7 @@ class MegaKernelModelBackend:
                 if self.routing_mode == "external"
                 else None
             )
-            padded_post = aligned_empty((rows, 128), torch.float32, hidden_states.device)
-            padded_comb = aligned_empty((rows, 128), torch.float32, hidden_states.device)
-            padded_post.zero_()
-            padded_comb.zero_()
+            padded_post, padded_comb = _aligned_mhc_buffers(rows, torch.float32, hidden_states.device, aligned_empty)
             if layer.layer_idx == 0 and post is None:
                 # HcPost(identity, zero) reproduces the first layer's hc_expand.
                 model_residual = hidden_states.unsqueeze(1).expand(-1, 4, -1).contiguous()

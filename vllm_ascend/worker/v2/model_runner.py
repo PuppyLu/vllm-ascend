@@ -330,6 +330,15 @@ class NPUModelRunner(GPUModelRunner):
                     ) from exc
 
                 self.debugger = AclGraphDumper(dump_cfg)
+        self._decode_layer_kernel_gate = None
+        self._decode_step_trace = None
+        if (
+            self.ascend_config.decode_layer_kernel_config_path is not None
+            or self.ascend_config.decode_step_trace_dir is not None
+        ):
+            from vllm_ascend.models.glm5next.mega_kernel_bootstrap import install_runner_hooks
+
+            self._decode_layer_kernel_gate = install_runner_hooks(type(self))
         self.runtime_guard = RuntimeGuardProcessor.bind(self)
         self._kv_trace = install_trace(self)
 
@@ -379,6 +388,21 @@ class NPUModelRunner(GPUModelRunner):
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
         self.model_state.prompt_logprobs_worker = self.prompt_logprobs_worker
+        if self.ascend_config.decode_layer_kernel_config_path is not None:
+            if load_dummy_weights:
+                raise ValueError("experimental Decode layer kernel requires actual post-loaded model weights")
+            from vllm_ascend.models.glm5next.mega_kernel_bootstrap import bootstrap
+
+            bootstrap(self, self.ascend_config.decode_layer_kernel_config_path)
+        if self.ascend_config.decode_step_trace_dir is not None:
+            from vllm_ascend.models.glm5next.mega_kernel_step_trace import install_decode_step_trace
+
+            self._decode_step_trace = install_decode_step_trace(
+                self,
+                self._decode_layer_kernel_gate,
+                self.ascend_config,
+                group_agreed=self.ascend_config.decode_layer_kernel_config_path is not None,
+            )
 
     @runtime_guard_sample_tokens
     def sample_tokens(self, grammar_output):
@@ -643,6 +667,49 @@ class NPUModelRunner(GPUModelRunner):
     def shutdown(self) -> None:
         from vllm_ascend.distributed.expert_transfer import expert_offload_utils as expert_offload
 
+        model = getattr(self, "model", None)
+        if self.ascend_config.decode_layer_kernel_config_path is not None and model is not None:
+            for layer in model.modules():
+                stats = getattr(layer, "_megakernel_stats", None)
+                if stats is not None:
+                    logger.info("MegaKernel layer %s counters: %s", layer.layer_idx, stats)
+
+        shutdown_error = None
+        if self._decode_step_trace is not None:
+            try:
+                # Drain once at shutdown, never once per measured step.
+                torch.npu.synchronize()
+                self._decode_step_trace.dump(self)
+            except Exception as exc:
+                shutdown_error = exc
+                logger.exception("Failed to save Decode step timing; do not use incomplete traces")
+            try:
+                # The trace hook wraps the phase hook, so remove it first.
+                self._decode_step_trace.uninstall()
+            except Exception as exc:
+                if shutdown_error is None:
+                    shutdown_error = exc
+                logger.exception("Failed to remove Decode step timing hook")
+            self._decode_step_trace = None
+
+        for session in getattr(self, "_megakernel_sessions", ()):
+            try:
+                session.close()
+            except Exception as exc:
+                if shutdown_error is None:
+                    shutdown_error = exc
+                logger.exception("MegaKernel session teardown failed; terminate the entire distributed job")
+        self._megakernel_sessions = []
+        if self._decode_layer_kernel_gate is not None:
+            try:
+                from vllm_ascend.models.glm5next.mega_kernel_bootstrap import uninstall_runner_hooks
+
+                uninstall_runner_hooks()
+            except Exception as exc:
+                if shutdown_error is None:
+                    shutdown_error = exc
+                logger.exception("Failed to remove Decode phase hook")
+            self._decode_layer_kernel_gate = None
         expert_offload.shutdown(self)
 
         model = getattr(self, "model", None)
@@ -699,6 +766,8 @@ class NPUModelRunner(GPUModelRunner):
                     del pending[index]
             if errors:
                 raise EngramSharedReleaseError("; ".join(errors))
+        if shutdown_error is not None:
+            raise RuntimeError("Decode kernel or timing teardown failed") from shutdown_error
 
     def _register_sparse_kv_caches(self, kv_caches: dict[str, Any]) -> None:
         """Bind host pools before the V2 KV connector registers its destinations."""

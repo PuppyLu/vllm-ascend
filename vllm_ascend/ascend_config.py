@@ -698,6 +698,12 @@ class AscendConfig:
     model_config = ConfigDict(extra="forbid")
 
     # ---- user-input switches: bool/int/list/str, auto type validation ----
+    # Optional experimental model-layer Decode kernel configuration.
+    decode_layer_kernel_config_path: str | None = None
+    decode_step_trace_dir: str | None = None
+    decode_step_trace_label: str = "decode"
+    decode_step_target_requests: int = 64
+    decode_step_output_join_attested: bool = False
     enable_cpu_binding: bool = True
     shared_engram: SharedEngramConfig | None = None
     multistream_dsv4_dsa_overlap: bool = True
@@ -806,6 +812,16 @@ class AscendConfig:
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):
+        if self.decode_layer_kernel_config_path is not None and not os.path.isabs(self.decode_layer_kernel_config_path):
+            raise ValueError("decode_layer_kernel_config_path must be an absolute path")
+        if self.decode_step_trace_dir is not None and not os.path.isabs(self.decode_step_trace_dir):
+            raise ValueError("decode_step_trace_dir must be an absolute path")
+        if (
+            self.decode_step_target_requests <= 0
+            or not self.decode_step_trace_label
+            or "/" in self.decode_step_trace_label
+        ):
+            raise ValueError("invalid Decode step target or trace label")
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
         # TODO(zzzzwwjj): remove it after deprecating `enable_mc2_hierarchy_comm`.

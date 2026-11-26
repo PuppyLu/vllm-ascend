@@ -27,6 +27,20 @@ class UnsupportedDecode(ValueError):
     """Before a collective launch, this layer must use the original path."""
 
 
+def validate_model_path_config(config: dict[str, Any]) -> None:
+    """Reject stale mode keys instead of silently changing their semantics."""
+    if "routing_mode" in config or "execution_mode" in config:
+        raise ValueError("remove obsolete routing_mode and execution_mode; the model has one MC2 path")
+
+
+def benchmark_consumer_ready(outputs: Any) -> None:
+    """Use identical timing boundaries on the two replay paths."""
+    import torch
+
+    del outputs
+    torch.npu.synchronize()
+
+
 def coordinate_layer_preflight(error: Exception | None, pure_decode: bool, device: Any, group: Any) -> bool:
     """Agree on accept, fallback, or abort in one group reduction."""
     import torch
@@ -353,85 +367,6 @@ class DecodeLayerAdapter:
         layer.forward = types.MethodType(forward, layer)
 
 
-def compute_model_routes(
-    layer: Any, positions: Any, hidden_states: Any, residual: Any, post: Any, comb: Any, *, temporary_cache: Any = None
-) -> tuple[Any, Any]:
-    """Compute the real vLLM router on a temporary copy of the input KDA states.
-
-    This eager-only path repeats attention and is intentionally slow. It avoids
-    routing from the wrong hidden state; its cost belongs in fused-path timing.
-    KV transfer connectors are not supported for this provisional execution.
-    """
-    import torch
-    from vllm.distributed.kv_transfer import has_kv_transfer_group
-
-    if has_kv_transfer_group():
-        raise UnsupportedDecode("external-route prefix does not support a KV transfer connector")
-    attn = layer.self_attn
-    old_cache = attn.kv_cache
-    if not isinstance(old_cache, (tuple, list)) or len(old_cache) != 2:
-        raise UnsupportedDecode("missing KDA state")
-    temporary = temporary_cache if temporary_cache is not None else (old_cache[0].clone(), old_cache[1].clone())
-    attn.kv_cache = temporary
-    try:
-        # Matches the unmodified Glm5NextDecoderLayer.forward prefix. The KDA
-        # custom op resolves this same attention object via static context.
-        if layer.layer_idx == 0 and post is None:
-            from vllm_ascend.models.glm5next.ops.mhc_ops import hc_expand
-
-            x_res = hc_expand(hidden_states, layer.n)
-            x_post, x_comb, x = layer.hc_pre(
-                x_res,
-                layer.hc_attn_fn,
-                layer.hc_attn_scale,
-                layer.hc_attn_base,
-                norm_weight=layer.input_layernorm.weight.data,
-                norm_eps=layer.input_layernorm.variance_epsilon,
-            )
-        else:
-            x_res, x_post, x_comb, x = layer.hc_post_pre(
-                hidden_states,
-                residual,
-                post,
-                comb,
-                layer.hc_attn_fn,
-                layer.hc_attn_scale,
-                layer.hc_attn_base,
-                norm_weight=layer.input_layernorm.weight.data,
-                norm_eps=layer.input_layernorm.variance_epsilon,
-            )
-        x = attn(hidden_states=x, positions=positions)
-        _, _, _, ffn_input = layer.hc_post_pre(
-            x,
-            x_res,
-            x_post,
-            x_comb,
-            layer.hc_ffn_fn,
-            layer.hc_ffn_scale,
-            layer.hc_ffn_base,
-            norm_weight=layer.post_attention_layernorm.weight.data,
-            norm_eps=layer.post_attention_layernorm.variance_epsilon,
-        )
-        # Use the real Ascend runner gate and router to preserve its precision,
-        # top-k order, score correction, normalization and scaling.
-        runner = layer.mlp.experts
-        routed = runner.routed_experts
-        if not callable(getattr(runner, "_compute_router_logits", None)):
-            raise UnsupportedDecode("vLLM runner does not expose the verified gate path")
-        if not callable(getattr(routed, "_select_experts", None)):
-            raise UnsupportedDecode("vLLM runner does not expose its router")
-        if runner.is_internal_router:
-            logits = runner._compute_router_logits(ffn_input, ffn_input)
-        else:
-            logits, _ = layer.mlp.gate(ffn_input)
-        weights, ids = routed._select_experts(ffn_input, logits, enable_force_load_balance=False)
-        if ids.ndim != 2 or weights.shape != ids.shape or ids.shape[0] != hidden_states.shape[0]:
-            raise RuntimeError("router returned incompatible ids/weights")
-        return ids.to(dtype=torch.int32).contiguous(), weights.to(dtype=torch.float32).contiguous()
-    finally:
-        attn.kv_cache = old_cache
-
-
 def _copy_live_kda_slots(cache: Any, state_indices: Any) -> tuple[Any, Any]:
     """Build temporary KDA pools containing only this step's live state slots."""
     import torch
@@ -501,16 +436,11 @@ class MegaKernelModelBackend:
         static_weights: dict[str, Any],
         attrs: dict[str, Any],
         identity_factory: Callable[..., Any],
-        *,
-        routing_mode: str = "external",
     ):
         if not callable(getattr(session, "forward", None)) or not callable(identity_factory):
             raise TypeError("MC2 session and model identity factory are required")
-        if routing_mode not in ("external", "internal"):
-            raise ValueError("routing_mode must be external or internal")
         self.session, self.static_weights, self.attrs = session, dict(static_weights), dict(attrs)
         self.identity_factory = identity_factory
-        self.routing_mode = routing_mode
 
     def validate(
         self, layer: Any, decode: DecodeInputs, hidden_states: Any, residual: Any, post: Any, comb: Any
@@ -531,7 +461,7 @@ class MegaKernelModelBackend:
             if tuple(post.shape) != (rows, 4, 1) or tuple(comb.shape) != (rows, 4, 4):
                 raise UnsupportedDecode("incoming mHC mixing tensors do not match the model contract")
         if has_kv_transfer_group():
-            raise UnsupportedDecode("external-route prefix does not support a KV transfer connector")
+            raise UnsupportedDecode("MC2 adapter does not support a KV transfer connector")
         runner = layer.mlp.experts
         routed = getattr(runner, "routed_experts", None)
         if not callable(getattr(routed, "_select_experts", None)):
@@ -544,13 +474,12 @@ class MegaKernelModelBackend:
             raise UnsupportedDecode("vLLM model does not expose its gate")
         router = getattr(routed, "router", None)
         if getattr(router, "routed_scaling_factor", None) != getattr(layer.mlp, "routed_scaling_factor", None):
-            raise UnsupportedDecode("vLLM routed scale is not fully included in external routing weights")
-        if self.routing_mode == "internal":
-            from vllm_ascend.ascend_config import get_ascend_config
+            raise UnsupportedDecode("vLLM router and model routed scales differ")
+        from vllm_ascend.ascend_config import get_ascend_config
 
-            if getattr(get_ascend_config(), "enable_force_eplb", False):
-                raise UnsupportedDecode("MC2 internal routing does not support forced expert load balancing")
-            _validate_internal_router(layer, router)
+        if getattr(get_ascend_config(), "enable_force_eplb", False):
+            raise UnsupportedDecode("MC2 internal routing does not support forced expert load balancing")
+        _validate_internal_router(layer, router)
         routed_cfg = getattr(routed, "moe_config", None)
         if (
             getattr(layer.mlp.shared_experts, "swiglu_limit", None) != 10.0
@@ -569,13 +498,6 @@ class MegaKernelModelBackend:
         rows = decode.rows
         error = None
         try:
-            # Allocate everything that can fail locally before the reference
-            # prefix enters the real TP collective.
-            temporary_cache = (
-                _copy_live_kda_slots(layer.self_attn.kv_cache, decode.state_indices)
-                if self.routing_mode == "external"
-                else None
-            )
             padded_post, padded_comb = _aligned_mhc_buffers(rows, torch.float32, hidden_states.device, aligned_empty)
             if layer.layer_idx == 0 and post is None:
                 # HcPost(identity, zero) reproduces the first layer's hc_expand.
@@ -603,14 +525,14 @@ class MegaKernelModelBackend:
             inputs = {name: None for name in MC2_INPUT_NAMES}
             inputs.update(self.static_weights)
             inputs.update(
-                x=aligned_copy(model_residual),
-                post_h_out=aligned_copy(model_post_out),
+                x=model_residual,
+                post_h_out=model_post_out,
                 post_h_post=padded_post,
                 post_h_res=padded_comb,
                 conv_state=staged_states[0],
                 recurrent_state=staged_states[1],
-                cu_seqlens=aligned_copy(decode.cu_seqlens),
-                state_indices=aligned_copy(decode.state_indices),
+                cu_seqlens=decode.cu_seqlens,
+                state_indices=decode.state_indices,
             )
             if set(inputs) != set(MC2_INPUT_NAMES):
                 raise RuntimeError("mapped inputs differ from MC2 ABI")
@@ -620,26 +542,9 @@ class MegaKernelModelBackend:
         _agree(error, self.session.config.control_device, self.session.config.control_group, "model route preparation")
         if error is not None:
             raise error
-        if self.routing_mode == "external":
-            error = None
-            try:
-                ids, weights = compute_model_routes(
-                    layer, positions, hidden_states, residual, post, comb, temporary_cache=temporary_cache
-                )
-                inputs.update(external_route_ids=aligned_copy(ids), external_route_weights=aligned_copy(weights))
-            except Exception as exc:
-                # A failure inside an already-entered TP collective requires
-                # the distributed job watchdog, not local rollback or retry.
-                error = exc
-            _agree(
-                error,
-                self.session.config.control_device,
-                self.session.config.control_group,
-                "model routing preparation",
-            )
-            if error is not None:
-                raise error
-        result = self.session.forward(inputs, self.attrs, identity)
+        # The enclosing wrapper validated the query and slots and all ranks
+        # agreed before entering MC2. The session owns its executor bindings.
+        result = self.session.forward(inputs, self.attrs, identity, validated_step=True)
         # Every rank enters the post-commit agreement, even when only some
         # layouts require a separate convolution-state copy.
         error = None

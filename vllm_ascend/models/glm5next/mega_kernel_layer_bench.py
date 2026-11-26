@@ -285,6 +285,14 @@ def measure(
                 start.record(stream)
                 fn = layer._megakernel_original_forward if mode == "original" else layer._megakernel_benchmark_forward
                 out = fn(positions, hidden_states, residual, post, comb)
+                device_values = None
+                if capture:
+                    if not isinstance(out, tuple) or len(out) != 4:
+                        raise ValueError("model layer must return four values")
+                    # Observe the output through a later device operation
+                    # before any diagnostic host read. Not a substitute for
+                    # checking the actual next layer and multi-step inference.
+                    device_values = tuple(x.detach().clone() if isinstance(x, torch.Tensor) else x for x in out)
                 consumer_ready(mode, out)
                 end.record(stream)
                 torch.npu.synchronize()
@@ -295,7 +303,7 @@ def measure(
                     raise RuntimeError(f"{mode} model call did not take the expected path: hits={hits}")
                 if not isinstance(out, tuple) or len(out) != 4:
                     raise ValueError("model layer must return four values")
-                values = tuple(_clone(x) for x in out)
+                values = tuple(_clone(x) for x in (device_values if device_values is not None else out))
                 conv = (
                     work[0].transpose(-1, -2) if getattr(layer.self_attn, "_conv_state_dim_first", False) else work[0]
                 )
@@ -361,6 +369,7 @@ def measure(
             "world_size": world,
             "warmup": warmup,
             "samples": samples,
+            "device_consumer_snapshot": True,
             "summary": summary,
             "rank_records": records,
             "measurement_note": (

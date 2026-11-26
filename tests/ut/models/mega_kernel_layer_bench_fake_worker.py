@@ -182,7 +182,7 @@ result = m.measure(
     warmup=0,
     samples=1,
 )
-assert result["status"] == "PAIRED_LIVE_LAYER_PASS"
+assert result["status"] == "PAIRED_LIVE_LAYER_PASS" and result["device_consumer_snapshot"] is True
 
 
 def bad_fused(*args):

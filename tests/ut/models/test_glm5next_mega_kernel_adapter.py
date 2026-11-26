@@ -20,7 +20,6 @@ sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 UnsupportedDecode = module.UnsupportedDecode
 prepare_decode_inputs = module.prepare_decode_inputs
-compute_model_routes = module.compute_model_routes
 
 
 class DecodeMetadataTests(unittest.TestCase):
@@ -75,6 +74,25 @@ class DecodeMetadataTests(unittest.TestCase):
             execution_mode=mode,
             scheduler_pure_decode=evidence,
         )
+
+    def test_benchmark_consumer_has_no_host_read(self):
+        calls = []
+        fake_npu = NS(synchronize=lambda: calls.append("sync"))
+        orig_cpu = torch.Tensor.cpu
+
+        def observe(tensor, *args, **kwargs):
+            calls.append("d2h")
+            return orig_cpu(tensor, *args, **kwargs)
+
+        with patch.object(torch, "npu", fake_npu, create=True), patch.object(torch.Tensor, "cpu", observe):
+            module.benchmark_consumer_ready((self.hidden, None, self.post))
+        self.assertEqual(calls, ["sync"])
+
+    def test_stale_mode_options_are_rejected(self):
+        module.validate_model_path_config({})
+        for config in ({"routing_mode": "internal"}, {"routing_mode": "external"}, {"execution_mode": "fast"}):
+            with self.assertRaisesRegex(ValueError, "remove obsolete"):
+                module.validate_model_path_config(config)
 
     def test_real_layer_replay_protocol_in_isolated_cpu_process(self):
         worker = Path(__file__).with_name("mega_kernel_layer_bench_fake_worker.py")
@@ -192,56 +210,6 @@ class DecodeMetadataTests(unittest.TestCase):
         tmp_conv[1].zero_()
         self.assertNotEqual(conv[1].count_nonzero().item(), 0)
 
-    def test_original_router_receives_ffn_input_and_model_states_stay_unchanged(self):
-        class Attention:
-            def __init__(self):
-                self.kv_cache = (torch.zeros(2, 3), torch.zeros(2, 3))
-
-            def __call__(self, *, hidden_states, positions):
-                self.kv_cache[0].add_(2)
-                self.kv_cache[1].add_(3)
-                return hidden_states + 1
-
-        attn = Attention()
-
-        def hc(hidden, residual, post, comb, *args, **kwargs):
-            return residual, post, comb, hidden + 1
-
-        def select(hidden, logits, enable_force_load_balance):
-            self.assertFalse(enable_force_load_balance)
-            torch.testing.assert_close(logits, hidden + 10)
-            return torch.full((2, 8), 0.25), torch.arange(8).repeat(2, 1)
-
-        runner = NS(
-            is_internal_router=True,
-            _compute_router_logits=lambda hidden, ignored: hidden + 10,
-            routed_experts=NS(_select_experts=select),
-        )
-        layer = NS(
-            layer_idx=4,
-            self_attn=attn,
-            hc_post_pre=hc,
-            hc_attn_fn=None,
-            hc_attn_scale=None,
-            hc_attn_base=None,
-            hc_ffn_fn=None,
-            hc_ffn_scale=None,
-            hc_ffn_base=None,
-            input_layernorm=NS(weight=torch.ones(1), variance_epsilon=1e-6),
-            post_attention_layernorm=NS(weight=torch.ones(1), variance_epsilon=1e-6),
-            mlp=NS(experts=runner),
-        )
-        fake = ModuleType("vllm.distributed.kv_transfer")
-        fake.has_kv_transfer_group = lambda: False
-        orig_cache = attn.kv_cache
-        with patch.dict(sys.modules, {"vllm.distributed.kv_transfer": fake}):
-            ids, weights = compute_model_routes(layer, None, self.hidden, self.residual, self.post, self.comb)
-        self.assertIs(attn.kv_cache, orig_cache)
-        self.assertEqual(attn.kv_cache[0].count_nonzero().item(), 0)
-        self.assertEqual(attn.kv_cache[1].count_nonzero().item(), 0)
-        self.assertEqual(ids.dtype, torch.int32)
-        self.assertEqual(weights.dtype, torch.float32)
-
     def test_internal_router_contract_rejects_incompatible_model(self):
         bias = torch.zeros(288)
         router = type("AscendFusedTopKRouter", (), {})()
@@ -278,7 +246,7 @@ class DecodeMetadataTests(unittest.TestCase):
         grouped.use_grouped_topk = True
         module._validate_internal_router(layer, grouped)
 
-    def test_internal_routing_skips_reference_prefix_and_passes_no_external_routes(self):
+    def test_internal_routing_passes_validated_inputs_without_replaying_prefix(self):
         names = (
             "x",
             "post_h_out",
@@ -302,15 +270,15 @@ class DecodeMetadataTests(unittest.TestCase):
         votes = []
         collectives._agree = lambda error, *a: votes.append(a[-1])
         seen = {}
+        validated = []
 
-        def forward(inputs, attrs, identity):
+        def forward(inputs, attrs, identity, *, validated_step):
             seen.update(inputs)
+            validated.append(validated_step)
             return (self.hidden, self.residual, self.post, self.comb)
 
         session = NS(forward=forward, config=NS(control_device="cpu", control_group=None))
-        backend = module.MegaKernelModelBackend(
-            session, {"static": 1}, {}, lambda *a: "identity", routing_mode="internal"
-        )
+        backend = module.MegaKernelModelBackend(session, {"static": 1}, {}, lambda *a: "identity")
         decode = self.prepare()
         fake_npu = NS(current_stream=lambda device: NS(synchronize=lambda: None))
         modules = {
@@ -321,13 +289,17 @@ class DecodeMetadataTests(unittest.TestCase):
         with (
             patch.dict(sys.modules, modules),
             patch.object(torch, "npu", fake_npu, create=True),
-            patch.object(module, "compute_model_routes", side_effect=AssertionError("repeated prefix")),
-            patch.object(module, "_copy_live_kda_slots", side_effect=AssertionError("temporary cache")),
+            patch.object(module, "_copy_live_kda_slots", side_effect=AssertionError("repeated prefix")),
         ):
             result = backend(self.layer, None, self.hidden, self.residual, self.post, self.comb, decode)
         self.assertEqual(len(result), 4)
+        self.assertEqual(validated, [True])
         self.assertIsNone(seen["external_route_ids"])
         self.assertIsNone(seen["external_route_weights"])
+        self.assertIs(seen["x"], self.residual)
+        self.assertIs(seen["post_h_out"], self.hidden)
+        self.assertIs(seen["state_indices"], decode.state_indices)
+        self.assertIs(seen["cu_seqlens"], decode.cu_seqlens)
         self.assertEqual(votes, ["model route preparation", "model convolution state writeback"])
         post_pad, comb_pad = seen["post_h_post"], seen["post_h_res"]
         self.assertEqual(comb_pad.data_ptr() - post_pad.data_ptr(), 2 * 128 * 4)
@@ -335,23 +307,6 @@ class DecodeMetadataTests(unittest.TestCase):
         torch.testing.assert_close(comb_pad[:, :16], self.comb.reshape(2, 16))
         self.assertEqual(post_pad[:, 4:].count_nonzero().item(), 0)
         self.assertEqual(comb_pad[:, 16:].count_nonzero().item(), 0)
-        votes.clear()
-        external = module.MegaKernelModelBackend(session, {"static": 1}, {}, lambda *a: "identity")
-        ids = torch.arange(8, dtype=torch.int32).repeat(2, 1)
-        weights = torch.full((2, 8), 0.125)
-        with (
-            patch.dict(sys.modules, modules),
-            patch.object(torch, "npu", fake_npu, create=True),
-            patch.object(module, "compute_model_routes", return_value=(ids, weights)) as route,
-            patch.object(module, "_copy_live_kda_slots", return_value=(None, None)),
-        ):
-            external(self.layer, None, self.hidden, self.residual, self.post, self.comb, decode)
-        route.assert_called_once()
-        torch.testing.assert_close(seen["external_route_ids"], ids)
-        torch.testing.assert_close(seen["external_route_weights"], weights)
-        self.assertEqual(
-            votes, ["model route preparation", "model routing preparation", "model convolution state writeback"]
-        )
 
     def test_reject_nonuniform_tokens_and_duplicate_slots(self):
         self.meta.non_spec_query_start_loc = torch.tensor([0, 0, 2])

@@ -196,11 +196,13 @@ def prepare_decode_inputs(
         or recurrent_state.device != hidden_states.device
     ):
         raise UnsupportedDecode("KDA state dtype, shape or device differs from the MC2 ABI")
-    # MC2 requires contiguous ND. When the model stores dimension-first
-    # convolution state, retain its view and publish the provisional copy back
-    # after the collective succeeds; never silently update a detached copy.
+    # The session copies only active slots into its own contiguous MC2 state.
+    # A transpose of a contiguous physical cache has no self-overlap and can
+    # be updated through the view after a successful launch. Keep the old
+    # whole-pool conversion for other, unverified non-contiguous layouts.
     conv_writeback = None
-    if not conv_state.is_contiguous():
+    transposed_contiguous = getattr(attn, "_conv_state_dim_first", False) and cache[0].is_contiguous()
+    if not conv_state.is_contiguous() and not transposed_contiguous:
         conv_writeback = conv_state
         conv_state = conv_state.contiguous()
     if not recurrent_state.is_contiguous():
@@ -493,7 +495,7 @@ class MegaKernelModelBackend:
         import torch
         from cross_rank_prototype.staged_collectives import _agree
         from mc2_integration.projection_contract import MC2_INPUT_NAMES
-        from mc2_integration.torch_acl_bridge import _check_tensor, aligned_copy, aligned_empty
+        from mc2_integration.torch_acl_bridge import aligned_empty
 
         rows = decode.rows
         error = None
@@ -510,18 +512,9 @@ class MegaKernelModelBackend:
                 model_post_out = hidden_states
                 padded_post[:, :4].copy_(post.reshape(rows, 4))
                 padded_comb[:, :16].copy_(comb.reshape(rows, 16))
-            # The live vLLM allocations are not guaranteed to satisfy MC2's
-            # 512-byte alignment and padded-tail ABI. Keep explicit copies and
-            # write them back after a successful group execution when needed.
-            staged_states = []
-            for state in (decode.conv_state, decode.recurrent_state):
-                try:
-                    _check_tensor(state, hidden_states.device)
-                    staged = state
-                except ValueError:
-                    staged = aligned_copy(state)
-                    _check_tensor(staged, hidden_states.device)
-                staged_states.append(staged)
+            # The session copies live slots into its own aligned, contiguous
+            # provisional state and commits those slots on success. Model
+            # state therefore need not itself be aligned or contiguous.
             inputs = {name: None for name in MC2_INPUT_NAMES}
             inputs.update(self.static_weights)
             inputs.update(
@@ -529,8 +522,8 @@ class MegaKernelModelBackend:
                 post_h_out=model_post_out,
                 post_h_post=padded_post,
                 post_h_res=padded_comb,
-                conv_state=staged_states[0],
-                recurrent_state=staged_states[1],
+                conv_state=decode.conv_state,
+                recurrent_state=decode.recurrent_state,
                 cu_seqlens=decode.cu_seqlens,
                 state_indices=decode.state_indices,
             )
@@ -549,13 +542,9 @@ class MegaKernelModelBackend:
         # layouts require a separate convolution-state copy.
         error = None
         try:
-            if staged_states[0] is not decode.conv_state:
-                decode.conv_state.copy_(staged_states[0])
-            if staged_states[1] is not decode.recurrent_state:
-                decode.recurrent_state.copy_(staged_states[1])
             if decode.conv_writeback is not None:
                 decode.conv_writeback.copy_(decode.conv_state)
-            torch.npu.current_stream(hidden_states.device).synchronize()
+                torch.npu.current_stream(hidden_states.device).synchronize()
         except Exception as exc:
             error = exc
         _agree(

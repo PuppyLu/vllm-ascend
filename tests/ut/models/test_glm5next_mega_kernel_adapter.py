@@ -189,16 +189,144 @@ class DecodeMetadataTests(unittest.TestCase):
                 scheduler_pure_decode=True,
             )
 
-    def test_transposed_convolution_state_retains_writeback_view(self):
+    def test_transposed_convolution_state_uses_live_view_for_active_slots(self):
         original = torch.arange(4 * 384 * 3).reshape(4, 384, 3).to(torch.bfloat16)
+        self.layer.self_attn.kv_cache = (original, torch.zeros(4, 1, 128, 128))
+        self.layer.self_attn._conv_state_dim_first = True
+        decoded = self.prepare()
+        self.assertFalse(decoded.conv_state.is_contiguous())
+        self.assertIsNone(decoded.conv_writeback)
+        self.assertEqual(decoded.conv_state.data_ptr(), original.data_ptr())
+        prior = original.clone()
+        slots = decoded.state_indices[:, 0].to(torch.int64)
+        updated = decoded.conv_state.index_select(0, slots) + 5
+        decoded.conv_state.index_copy_(0, slots, updated)
+        torch.testing.assert_close(original[[1, 3]], updated.transpose(-1, -2))
+        torch.testing.assert_close(original[[0, 2]], prior[[0, 2]])
+
+    def test_noncontiguous_physical_cache_keeps_safe_fallback(self):
+        pool = torch.arange(8 * 384 * 3).reshape(8, 384, 3).to(torch.bfloat16)
+        original = pool[::2]
         self.layer.self_attn.kv_cache = (original, torch.zeros(4, 1, 128, 128))
         self.layer.self_attn._conv_state_dim_first = True
         decoded = self.prepare()
         self.assertTrue(decoded.conv_state.is_contiguous())
         self.assertIsNotNone(decoded.conv_writeback)
-        decoded.conv_state.add_(5)
+        before = original.clone()
+        slots = decoded.state_indices[:, 0].to(torch.int64)
+        decoded.conv_state.index_copy_(0, slots, decoded.conv_state.index_select(0, slots) + 5)
+        torch.testing.assert_close(original, before)
         decoded.conv_writeback.copy_(decoded.conv_state)
-        torch.testing.assert_close(original.transpose(-1, -2), decoded.conv_state)
+        torch.testing.assert_close(original[[0, 2]], before[[0, 2]])
+        torch.testing.assert_close(original[[1, 3]], decoded.conv_state[[1, 3]].transpose(-1, -2))
+
+    def test_backend_commits_only_live_slots_and_keeps_group_agreement(self):
+        names = (
+            "x",
+            "post_h_out",
+            "post_h_post",
+            "post_h_res",
+            "conv_state",
+            "recurrent_state",
+            "cu_seqlens",
+            "state_indices",
+            "external_route_ids",
+            "external_route_weights",
+            "static",
+        )
+        projection = ModuleType("mc2_integration.projection_contract")
+        projection.MC2_INPUT_NAMES = names
+        bridge = ModuleType("mc2_integration.torch_acl_bridge")
+        bridge.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
+        collectives = ModuleType("cross_rank_prototype.staged_collectives")
+        votes = []
+
+        def agree(error, device, group, phase):
+            votes.append(phase)
+            if error:
+                raise error
+
+        collectives._agree = agree
+        modules = {
+            "mc2_integration.projection_contract": projection,
+            "mc2_integration.torch_acl_bridge": bridge,
+            "cross_rank_prototype.staged_collectives": collectives,
+        }
+        syncs = []
+        fake_npu = NS(current_stream=lambda device: NS(synchronize=lambda: syncs.append("sync")))
+
+        for fallback in (False, True):
+            with self.subTest(fallback=fallback):
+                physical = torch.zeros(8 if fallback else 4, 384, 3, dtype=torch.bfloat16)
+                conv = physical[::2] if fallback else physical
+                recurrent = torch.zeros(4, 1, 128, 128)
+                self.layer.self_attn.kv_cache = (conv, recurrent)
+                self.layer.self_attn._conv_state_dim_first = True
+                decoded = self.prepare()
+                self.assertEqual(decoded.conv_writeback is not None, fallback)
+                votes.clear()
+                syncs.clear()
+
+                def forward(inputs, attrs, identity, *, validated_step, fallback=fallback, conv=conv):
+                    self.assertTrue(validated_step)
+                    for column, name, increment in ((0, "conv_state", 3), (1, "recurrent_state", 7)):
+                        state = inputs[name]
+                        slots = inputs["state_indices"][:, column].to(torch.int64)
+                        state.index_copy_(0, slots, state.index_select(0, slots) + increment)
+                    if fallback:
+                        self.assertEqual(conv.count_nonzero().item(), 0)
+                    return (self.hidden, self.residual, self.post, self.comb)
+
+                session = NS(forward=forward, config=NS(control_device="cpu", control_group=None))
+                backend = module.MegaKernelModelBackend(session, {"static": 1}, {}, lambda *a: "identity")
+                with patch.dict(sys.modules, modules), patch.object(torch, "npu", fake_npu, create=True):
+                    backend(self.layer, None, self.hidden, self.residual, self.post, self.comb, decoded)
+                self.assertTrue(torch.all(conv[[1, 3]] == 3))
+                self.assertEqual(conv[[0, 2]].count_nonzero().item(), 0)
+                self.assertTrue(torch.all(recurrent[[0, 2]] == 7))
+                self.assertEqual(recurrent[[1, 3]].count_nonzero().item(), 0)
+                self.assertEqual(votes, ["model route preparation", "model convolution state writeback"])
+                self.assertEqual(syncs, ["sync"] if fallback else [])
+
+    def test_backend_failure_does_not_publish_staged_cache(self):
+        names = (
+            "x",
+            "post_h_out",
+            "post_h_post",
+            "post_h_res",
+            "conv_state",
+            "recurrent_state",
+            "cu_seqlens",
+            "state_indices",
+            "external_route_ids",
+            "external_route_weights",
+            "static",
+        )
+        projection = ModuleType("mc2_integration.projection_contract")
+        projection.MC2_INPUT_NAMES = names
+        bridge = ModuleType("mc2_integration.torch_acl_bridge")
+        bridge.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
+        collectives = ModuleType("cross_rank_prototype.staged_collectives")
+        collectives._agree = lambda error, *args: None
+        modules = {
+            "mc2_integration.projection_contract": projection,
+            "mc2_integration.torch_acl_bridge": bridge,
+            "cross_rank_prototype.staged_collectives": collectives,
+        }
+        physical = torch.zeros(8, 384, 3, dtype=torch.bfloat16)[::2]
+        self.layer.self_attn.kv_cache = (physical, torch.zeros(4, 1, 128, 128))
+        self.layer.self_attn._conv_state_dim_first = True
+        decoded = self.prepare()
+
+        def fail(inputs, attrs, identity, *, validated_step):
+            inputs["conv_state"].fill_(9)
+            raise RuntimeError("distributed launch failed")
+
+        session = NS(forward=fail, config=NS(control_device="cpu", control_group=None))
+        backend = module.MegaKernelModelBackend(session, {"static": 1}, {}, lambda *a: "identity")
+        with patch.dict(sys.modules, modules), self.assertRaisesRegex(RuntimeError, "distributed launch failed"):
+            backend(self.layer, None, self.hidden, self.residual, self.post, self.comb, decoded)
+        self.assertEqual(physical.count_nonzero().item(), 0)
 
     def test_temporary_cache_copies_only_the_selected_state_slots(self):
         conv = torch.arange(24, dtype=torch.float32).reshape(4, 3, 2)

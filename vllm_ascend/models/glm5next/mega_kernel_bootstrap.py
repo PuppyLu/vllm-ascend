@@ -37,7 +37,7 @@ from vllm_ascend.models.glm5next.mega_kernel_adapter import (
 )
 from vllm_ascend.models.glm5next.mega_kernel_scheduler import V2SchedulerEvidence
 from vllm_ascend.models.glm5next.mega_kernel_torch_session import create_torch_session
-from vllm_ascend.models.glm5next.mega_kernel_weights import map_static_weights
+from vllm_ascend.models.glm5next.mega_kernel_weights import _reuse_or_align_weights, map_static_weights
 
 _gate = None
 
@@ -66,27 +66,6 @@ def _all_true(local, device, group):
     flag = torch.tensor([int(bool(local))], dtype=torch.int32, device=device)
     dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
     return bool(flag.item())
-
-
-def _reuse_or_align_weights(weights, device):
-    """Reuse distinct ABI-compatible tensors; copy only where needed."""
-    mapped = {}
-    spans = []
-    for name, value in weights.items():
-        if not isinstance(value, torch.Tensor):
-            mapped[name] = value
-            continue
-        try:
-            _check_tensor(value, device)
-            start, end = value.data_ptr(), value.data_ptr() + value.numel() * value.element_size()
-            if any(start < previous_end and previous_start < end for previous_start, previous_end in spans):
-                raise ValueError("static input overlaps another ABI input")
-            mapped[name] = value
-        except ValueError:
-            mapped[name] = aligned_copy(value)
-        start = mapped[name].data_ptr()
-        spans.append((start, start + mapped[name].numel() * mapped[name].element_size()))
-    return mapped
 
 
 def _layer_list(model):
@@ -296,7 +275,7 @@ def bootstrap(runner: Any, config_path: str):
             weights = map_static_weights(
                 layer, ep_rank=rank, ep_world=world, allow_nz=cfg.get("allow_nz") is True, expert_postprocessed=True
             )
-            weights = _reuse_or_align_weights(weights, device)
+            weights = _reuse_or_align_weights(weights, device, _check_tensor, aligned_copy)
             _check_attrs(layer, item["attrs"], 28, world)
             sc = Mc2SessionConfig(
                 cfg["opapi_path"],

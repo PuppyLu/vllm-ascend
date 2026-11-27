@@ -28,6 +28,8 @@ from mc2_integration.stage24_admission import (
 from mc2_integration.torch_acl_bridge import ATTR_NAMES, _check_tensor, initialized_outputs
 from mc2_integration.vllm_mc2_repeatable import RepeatableMegaKernelSession
 
+from vllm_ascend.models.glm5next.mega_kernel_weights import _validate_native_expert
+
 _INT_ATTRIBUTES = (
     "hc_mult",
     "hc_sinkhorn_iters",
@@ -215,9 +217,14 @@ class _TorchOperatorAdmission:
             raise ValueError("input must belong to the current NPU")
         outputs = initialized_outputs(x.device, self.heads_per_shard, rows=int(x.shape[0]), stage23=True)
         spans = []
-        for value in (*inputs.values(), *outputs):
+        for name, value in (*inputs.items(), *((None, output) for output in outputs)):
             if value is not None:
-                _check_tensor(value, x.device)
+                is_expert = name in ("batch_expert_weight", "batch_expert_down_weight")
+                if is_expert:
+                    _validate_native_expert(value)
+                    _check_tensor(value, x.device, allow_expert_view=True)
+                else:
+                    _check_tensor(value, x.device)
                 start = int(value.data_ptr())
                 spans.append((start, start + ((value.numel() * value.element_size() + 31) // 32) * 32))
         spans.sort()

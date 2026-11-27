@@ -66,6 +66,11 @@ def _load_module():
     bridge.ATTR_NAMES = attrs
     bridge._check_tensor = bridge.initialized_outputs = lambda *a, **k: None
     modules["mc2_integration.vllm_mc2_repeatable"].RepeatableMegaKernelSession = object
+    weight_path = Path(__file__).resolve().parents[3] / "vllm_ascend/models/glm5next/mega_kernel_weights.py"
+    weight_spec = importlib.util.spec_from_file_location("mc2_weight_cpu_test", weight_path)
+    weights = importlib.util.module_from_spec(weight_spec)
+    weight_spec.loader.exec_module(weights)
+    modules["vllm_ascend.models.glm5next.mega_kernel_weights"] = weights
     path = Path(__file__).resolve().parents[3] / "vllm_ascend/models/glm5next/mega_kernel_torch_session.py"
     spec = importlib.util.spec_from_file_location("mc2_torch_session_cpu_test", path)
     module = importlib.util.module_from_spec(spec)

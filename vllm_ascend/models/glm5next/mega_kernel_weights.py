@@ -6,8 +6,9 @@
 Only loaded weights are mapped here; per-step inputs, live states, routes,
 communication groups, MC2 invocation, graph lifetime and refit invalidation
 are the integrator's responsibility. This code has NOT been tested on A3.
-Call only after vLLM's process_weights_after_loading; expert matrices are
-explicitly transposed back from vLLM's [K,N] into MC2's [N,K].
+Call only after vLLM's process_weights_after_loading; expert matrices share
+the original contiguous ND [E,K,N] or INT8 NZ [E,K,N] storage directly.
+Neither form copies an expert bank.
 """
 
 from __future__ import annotations
@@ -52,6 +53,90 @@ def _weight(obj, name, shape, dtype, *, allow_nz):
     if value.dtype != dtype or tuple(value.shape) != tuple(shape):
         raise WeightContractError(f"{name}: expected {dtype} {tuple(shape)}, got {value.dtype} {tuple(value.shape)}")
     return value.contiguous()
+
+
+def _expert_format(value):
+    if value.device.type != "npu":
+        return 2
+    import torch_npu
+
+    return int(torch_npu.get_npu_format(value))
+
+
+def _native_expert_weight(obj, name, native_shape, dtype):
+    """Borrow contiguous ND or INT8 NZ native [E,K,N] storage directly.
+
+    Prefill keeps using the original tensor. Never cast or materialize an
+    expert bank: either operation duplicates its entire storage.
+    """
+    value = _tensor(obj, name)
+    fmt = _expert_format(value)
+    if value.dtype != dtype or tuple(value.shape) != tuple(native_shape):
+        raise WeightContractError(
+            f"{name}: expected {dtype} native {tuple(native_shape)}, got {value.dtype} {tuple(value.shape)}"
+        )
+    if fmt not in (0, 2, 29) or (fmt == 29 and dtype != torch.int8):
+        raise WeightContractError(f"{name}: unsupported expert storage format {fmt}")
+    if not value.is_contiguous():
+        raise WeightContractError(f"{name}: native [E,K,N] expert storage must be contiguous")
+    _validate_native_expert(value)
+    return value
+
+
+def _validate_native_expert(value):
+    """Validate a contiguous [E,K,N] ND or INT8 NZ expert bank."""
+    if not isinstance(value, torch.Tensor) or value.ndim != 3:
+        raise WeightContractError("expert bank must be a three-dimensional tensor")
+    fmt = _expert_format(value)
+    if fmt == 29:
+        if value.dtype != torch.int8 or not value.is_contiguous():
+            raise WeightContractError("FRACTAL_NZ expert bank must be contiguous INT8")
+        return value
+    if fmt not in (0, 2):
+        raise WeightContractError(f"unsupported expert storage format {fmt}")
+    if min(value.shape) <= 0 or not value.is_contiguous():
+        raise WeightContractError("expert bank must have contiguous native [E,K,N] storage")
+    return value
+
+
+def _expert_weight_pair(expert, up_shape, down_shape, dtype):
+    up = _native_expert_weight(expert, "w13_weight", up_shape, dtype)
+    down = _native_expert_weight(expert, "w2_weight", down_shape, dtype)
+    if (_expert_format(up) == 29) != (_expert_format(down) == 29):
+        raise WeightContractError("routed expert banks must both be ND or both be INT8 FRACTAL_NZ")
+    return up, down
+
+
+def _reuse_or_align_weights(weights, device, check_tensor, aligned_copy):
+    """Bind compatible weights without ever copying a large expert bank."""
+    mapped = {}
+    spans = []
+    for name, value in weights.items():
+        if not isinstance(value, torch.Tensor):
+            mapped[name] = value
+            continue
+        if name in ("batch_expert_weight", "batch_expert_down_weight"):
+            # Prefill owns this storage. Fail on invalid alignment, padding,
+            # layout or aliasing instead of allocating another expert bank.
+            _validate_native_expert(value)
+            check_tensor(value, device, allow_expert_view=True)
+            start, end = value.data_ptr(), value.data_ptr() + value.numel() * value.element_size()
+            if any(start < previous_end and previous_start < end for previous_start, previous_end in spans):
+                raise ValueError("expert weight overlaps another ABI input")
+            mapped[name] = value
+            spans.append((start, end))
+            continue
+        try:
+            check_tensor(value, device)
+            start, end = value.data_ptr(), value.data_ptr() + value.numel() * value.element_size()
+            if any(start < previous_end and previous_start < end for previous_start, previous_end in spans):
+                raise ValueError("static input overlaps another ABI input")
+            mapped[name] = value
+        except ValueError:
+            mapped[name] = aligned_copy(value)
+        start = mapped[name].data_ptr()
+        spans.append((start, start + mapped[name].numel() * mapped[name].element_size()))
+    return mapped
 
 
 def _scheme(module):
@@ -209,9 +294,10 @@ def map_static_weights(layer, *, ep_rank, ep_world, allow_nz=False, expert_postp
         routed_down_scale = _scale(expert, "w2_weight_scale", (hi - lo, 4096), allow_nz=allow_nz)
     else:
         raise WeightContractError("routed expert type is not verified BF16 or W8A8_DYNAMIC")
-    # vLLM post-load: checkpoint [E,N,K] -> [E,K,N] then possibly NZ.
-    w13 = _weight(expert, "w13_weight", (hi - lo, 4096, 4096), expert_dtype, allow_nz=allow_nz)
-    w2 = _weight(expert, "w2_weight", (hi - lo, 2048, 4096), expert_dtype, allow_nz=allow_nz)
+    # vLLM post-load: checkpoint [E,N,K] -> native [E,K,N], ND or INT8 NZ.
+    # Both layouts are passed in their native shape with contiguous strides.
+    # Never convert whole expert banks. Keep original weights for prefill.
+    w13, w2 = _expert_weight_pair(expert, (hi - lo, 4096, 4096), (hi - lo, 2048, 4096), expert_dtype)
     shared_up, shared_up_scale = _projection_pair(shared.gate_up_proj, width * 2, 4096, allow_nz=allow_nz)
     shared_down, shared_down_scale = _projection_pair(shared.down_proj, 4096, width, allow_nz=allow_nz)
     if shared_up.dtype != expert_dtype or shared_down.dtype != expert_dtype:
@@ -257,8 +343,8 @@ def map_static_weights(layer, *, ep_rank, ep_world, allow_nz=False, expert_postp
         "router_bias": _weight(moe.gate, "e_score_correction_bias", (288,), torch.float32, allow_nz=allow_nz),
         "expert_weight": shared_up,
         "expert_down_weight": shared_down,
-        "batch_expert_weight": w13.transpose(1, 2).contiguous(),
-        "batch_expert_down_weight": w2.transpose(1, 2).contiguous(),
+        "batch_expert_weight": w13,
+        "batch_expert_down_weight": w2,
         "expert_channel_scale": shared_up_scale,
         "expert_down_channel_scale": shared_down_scale,
         "batch_expert_channel_scale": routed_up_scale,

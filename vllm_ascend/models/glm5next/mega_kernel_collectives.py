@@ -13,6 +13,15 @@ class MegaKernelCollectiveError(RuntimeError):
     """All participants must terminate the job after a failed MC2 phase."""
 
 
+def enable_diagnostic_route_capture(session):
+    """Prepare a local snapshot before the benchmark's all-rank preflight."""
+    if session is None or not hasattr(session, "capture_routes"):
+        raise ValueError("MC2 session does not support diagnostic route capture")
+    previous = session.capture_routes
+    session.capture_routes = True
+    return previous
+
+
 def agree_or_abort(local_error, device, group, phase):
     """Complete a rank-consistent phase decision before downstream HCCL work."""
     failed = torch.tensor([int(local_error is not None)], dtype=torch.int32, device=device)

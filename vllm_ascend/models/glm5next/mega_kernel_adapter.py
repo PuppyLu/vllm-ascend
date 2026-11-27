@@ -247,8 +247,18 @@ def prepare_decode_inputs(
         if any(v < 0 or v >= capacity for v in vals) or len(set(vals)) != rows:
             raise UnsupportedDecode(f"{name} slots contain padding, invalid or duplicate state")
     indices = slot_pairs.to(dtype=torch.int32).contiguous()
-    # This MC2 ABI takes a single-token template, not the cumulative query offsets.
-    cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device=hidden_states.device)
+    # This immutable template is copied into the session's bound input before
+    # launch. Layer execution is serialized; include the stream in the cache
+    # key so another stream never consumes a newly allocated NPU tensor without
+    # inheriting its initialization dependency.
+    device = hidden_states.device
+    stream = int(torch.npu.current_stream(device).npu_stream) if device.type == "npu" else None
+    cache_key = (device, stream)
+    template = getattr(layer, "_megakernel_seq_template", None)
+    if template is None or template[0] != cache_key:
+        template = (cache_key, torch.tensor([0, 1], dtype=torch.int32, device=device))
+        layer._megakernel_seq_template = template
+    cu_seqlens = template[1]
     return DecodeInputs(metadata, conv_state, conv_writeback, recurrent_state, indices, cu_seqlens, rows)
 
 
@@ -533,9 +543,8 @@ class MegaKernelModelBackend:
         self, layer: Any, positions: Any, hidden_states: Any, residual: Any, post: Any, comb: Any, decode: DecodeInputs
     ) -> tuple[Any, Any, Any, Any]:
         import torch
-        from mc2_integration.projection_contract import MC2_INPUT_NAMES
-        from mc2_integration.torch_acl_bridge import aligned_empty
 
+        from vllm_ascend.models.glm5next.mega_kernel_abi import MC2_INPUT_NAMES, aligned_empty
         from vllm_ascend.models.glm5next.mega_kernel_collectives import agree_or_abort
 
         rows = decode.rows

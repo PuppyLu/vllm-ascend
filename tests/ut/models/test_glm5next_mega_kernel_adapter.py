@@ -117,6 +117,12 @@ class DecodeMetadataTests(unittest.TestCase):
         self.assertIs(result.conv_state, self.layer.self_attn.kv_cache[0])
         self.assertIs(result.recurrent_state, self.layer.self_attn.kv_cache[1])
 
+    def test_single_token_template_is_reused_for_the_same_layer(self):
+        first = self.prepare()
+        second = self.prepare()
+        self.assertIs(first.cu_seqlens, second.cu_seqlens)
+        torch.testing.assert_close(second.cu_seqlens, torch.tensor([0, 1], dtype=torch.int32))
+
     def test_integer_query_and_slot_values_share_one_host_read(self):
         original_cpu = torch.Tensor.cpu
         transfers = []
@@ -331,10 +337,9 @@ class DecodeMetadataTests(unittest.TestCase):
             "external_route_weights",
             "static",
         )
-        projection = ModuleType("mc2_integration.projection_contract")
-        projection.MC2_INPUT_NAMES = names
-        bridge = ModuleType("mc2_integration.torch_acl_bridge")
-        bridge.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
+        abi = ModuleType("vllm_ascend.models.glm5next.mega_kernel_abi")
+        abi.MC2_INPUT_NAMES = names
+        abi.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
         collectives = ModuleType("vllm_ascend.models.glm5next.mega_kernel_collectives")
         votes = []
 
@@ -345,8 +350,7 @@ class DecodeMetadataTests(unittest.TestCase):
 
         collectives.agree_or_abort = agree
         modules = {
-            "mc2_integration.projection_contract": projection,
-            "mc2_integration.torch_acl_bridge": bridge,
+            "vllm_ascend.models.glm5next.mega_kernel_abi": abi,
             "vllm_ascend.models.glm5next.mega_kernel_collectives": collectives,
         }
         syncs = []
@@ -399,15 +403,13 @@ class DecodeMetadataTests(unittest.TestCase):
             "external_route_weights",
             "static",
         )
-        projection = ModuleType("mc2_integration.projection_contract")
-        projection.MC2_INPUT_NAMES = names
-        bridge = ModuleType("mc2_integration.torch_acl_bridge")
-        bridge.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
+        abi = ModuleType("vllm_ascend.models.glm5next.mega_kernel_abi")
+        abi.MC2_INPUT_NAMES = names
+        abi.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
         collectives = ModuleType("vllm_ascend.models.glm5next.mega_kernel_collectives")
         collectives.agree_or_abort = lambda error, *args: None
         modules = {
-            "mc2_integration.projection_contract": projection,
-            "mc2_integration.torch_acl_bridge": bridge,
+            "vllm_ascend.models.glm5next.mega_kernel_abi": abi,
             "vllm_ascend.models.glm5next.mega_kernel_collectives": collectives,
         }
         physical = torch.zeros(8, 384, 3, dtype=torch.bfloat16)[::2]
@@ -485,12 +487,9 @@ class DecodeMetadataTests(unittest.TestCase):
             "external_route_weights",
             "static",
         )
-        projection = ModuleType("mc2_integration.projection_contract")
-        projection.MC2_INPUT_NAMES = names
-        bridge = ModuleType("mc2_integration.torch_acl_bridge")
-        bridge._check_tensor = lambda *a: None
-        bridge.aligned_copy = lambda value: value.clone()
-        bridge.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
+        abi = ModuleType("vllm_ascend.models.glm5next.mega_kernel_abi")
+        abi.MC2_INPUT_NAMES = names
+        abi.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
         collectives = ModuleType("vllm_ascend.models.glm5next.mega_kernel_collectives")
         votes = []
         collectives.agree_or_abort = lambda error, *a: votes.append(a[-1])
@@ -507,8 +506,7 @@ class DecodeMetadataTests(unittest.TestCase):
         decode = self.prepare()
         fake_npu = NS(current_stream=lambda device: NS(synchronize=lambda: None))
         modules = {
-            "mc2_integration.projection_contract": projection,
-            "mc2_integration.torch_acl_bridge": bridge,
+            "vllm_ascend.models.glm5next.mega_kernel_abi": abi,
             "vllm_ascend.models.glm5next.mega_kernel_collectives": collectives,
         }
         with (

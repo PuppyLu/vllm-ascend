@@ -15,8 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
-from mc2_integration.distributed_mc2 import _validate_expert_bank
-from mc2_integration.projection_contract import MC2_INPUT_NAMES, validate_external_routes, validate_projection_shapes
+from mc2_integration.projection_contract import validate_external_routes, validate_projection_shapes
 from mc2_integration.stage24_admission import (
     GENERAL_PROTOCOL,
     GRID_PROTOCOL,
@@ -25,9 +24,10 @@ from mc2_integration.stage24_admission import (
     PROTOCOL,
     SHARDED_SHARED_PROTOCOL,
 )
-from mc2_integration.torch_acl_bridge import ATTR_NAMES, _check_tensor, initialized_outputs
+from mc2_integration.torch_acl_bridge import _check_tensor, initialized_outputs
 from mc2_integration.vllm_mc2_repeatable import RepeatableMegaKernelSession
 
+from vllm_ascend.models.glm5next.mega_kernel_abi import ATTR_NAMES, MC2_INPUT_NAMES, validate_expert_bank
 from vllm_ascend.models.glm5next.mega_kernel_weights import _validate_native_expert
 
 _INT_ATTRIBUTES = (
@@ -210,7 +210,7 @@ class _TorchOperatorAdmission:
         if not isinstance(bank, torch.Tensor) or bank.ndim != 3:
             raise ValueError("missing expert bank")
         bank_args = {"shared_width": inputs["expert_down_weight"].shape[1]} if self.native_shared else {}
-        _validate_expert_bank(
+        validate_expert_bank(
             inputs, ep_rank, attrs["ep_world_size"], "replicated" if bank.shape[0] == 288 else "sharded", **bank_args
         )
         if x.device.type != "npu" or x.device.index != torch.npu.current_device():
@@ -245,4 +245,10 @@ def create_torch_session(config, model_epoch):
     module._builder.load()
     op = torch.ops.cann_ops_transformer.mega_kernel_mc2_out
     admission = _TorchOperatorAdmission(config, op)
-    return RepeatableMegaKernelSession(SimpleNamespace(config=config, bridge=admission), model_epoch)
+    session = RepeatableMegaKernelSession(SimpleNamespace(config=config, bridge=admission), model_epoch)
+    if not hasattr(session, "capture_routes"):
+        raise RuntimeError("MC2 session lacks capture_routes; update the matching ops-transformer runtime")
+    # Route snapshots are needed by the diagnostic layer comparison only.
+    # Avoid making two additional tensor copies on every production layer.
+    session.capture_routes = False
+    return session

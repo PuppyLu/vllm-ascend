@@ -17,8 +17,9 @@ def install_decode_step_trace(runner, gate, config, *, group_agreed):
     complete only when the caller has independently verified the event stream
     joins the needed communication dependencies. No per-step synchronization.
     """
-    from mc2_integration.vllm_v2_step_hook import V2DecodeStepHook
     from vllm.distributed.parallel_state import get_ep_group, get_pp_group, get_tp_group
+
+    from vllm_ascend.models.glm5next.mega_kernel_step_events import V2DecodeStepHook
 
     if not config.decode_step_output_join_attested:
         raise ValueError("Decode timing requires verified output/communication stream joining")

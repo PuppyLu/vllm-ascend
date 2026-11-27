@@ -48,6 +48,11 @@ def _load_module():
             "mc2_integration.vllm_mc2_repeatable",
         )
     }
+    abi = ModuleType("vllm_ascend.models.glm5next.mega_kernel_abi")
+    abi.ATTR_NAMES = attrs
+    abi.MC2_INPUT_NAMES = names
+    abi.validate_expert_bank = lambda *a, **k: None
+    modules["vllm_ascend.models.glm5next.mega_kernel_abi"] = abi
     modules["mc2_integration.distributed_mc2"]._validate_expert_bank = lambda *a, **k: None
     projection = modules["mc2_integration.projection_contract"]
     projection.MC2_INPUT_NAMES = names
@@ -112,6 +117,33 @@ class BoundBuffersTests(unittest.TestCase):
         self.assertEqual(self.calls[0][2], [int(self.attrs[n]) for n in self.module._INT_ATTRIBUTES])
         self.assertEqual(self.calls[0][3], [float(self.attrs[n]) for n in self.module._FLOAT_ATTRIBUTES])
         self.assertEqual(self.calls[0][4:], self.groups)
+
+    def test_production_session_does_not_capture_routes(self):
+        fake_module = SimpleNamespace(_builder=SimpleNamespace(load=lambda: None))
+        fake_npu_ops = SimpleNamespace(mega_kernel_mc2_out=self.op)
+        namespace = SimpleNamespace(cann_ops_transformer=fake_npu_ops)
+        created = SimpleNamespace(capture_routes=True)
+        with (
+            patch.object(self.module.importlib, "import_module", return_value=fake_module),
+            patch.object(self.module, "_TorchOperatorAdmission", return_value=object()),
+            patch.object(self.module, "RepeatableMegaKernelSession", return_value=created),
+            patch.object(torch, "ops", namespace),
+        ):
+            session = self.module.create_torch_session(object(), lambda: "epoch")
+        self.assertIs(session, created)
+        self.assertIs(session.capture_routes, False)
+
+    def test_old_runtime_without_capture_support_is_rejected(self):
+        fake_module = SimpleNamespace(_builder=SimpleNamespace(load=lambda: None))
+        namespace = SimpleNamespace(cann_ops_transformer=SimpleNamespace(mega_kernel_mc2_out=self.op))
+        with (
+            patch.object(self.module.importlib, "import_module", return_value=fake_module),
+            patch.object(self.module, "_TorchOperatorAdmission", return_value=object()),
+            patch.object(self.module, "RepeatableMegaKernelSession", return_value=SimpleNamespace()),
+            patch.object(torch, "ops", namespace),
+            self.assertRaisesRegex(RuntimeError, "update the matching ops-transformer runtime"),
+        ):
+            self.module.create_torch_session(object(), lambda: "epoch")
 
     def test_replaced_input_is_rejected_before_launch(self):
         bound = self.module._TorchBoundBuffers(self.inputs, self.outputs, self.attrs, self.groups, self.stream, self.op)

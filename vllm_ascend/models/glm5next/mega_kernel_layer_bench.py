@@ -37,6 +37,7 @@ from vllm.forward_context import get_forward_context
 
 from vllm_ascend.models.glm5next.mega_kernel_adapter import _copy_live_kda_slots, prepare_decode_inputs
 from vllm_ascend.models.glm5next.mega_kernel_collectives import agree_or_abort as _agree
+from vllm_ascend.models.glm5next.mega_kernel_collectives import enable_diagnostic_route_capture
 
 
 def _clone(value):
@@ -253,10 +254,16 @@ def measure(
 
     def run_once(mode, *, capture, timed):
         error, work, saved_route = None, None, None
+        session = getattr(layer, "_megakernel_session", None)
+        prior_capture_routes = None
+        capture_routes_changed = False
         routes = []
         try:
             work = _copy_live_kda_slots(snapshot, decoded.state_indices)
             layer.self_attn.kv_cache = work
+            if mode == "fused" and capture:
+                prior_capture_routes = enable_diagnostic_route_capture(session)
+                capture_routes_changed = True
             if capture:
                 had_instance_attr = "_select_experts" in route_owner.__dict__
                 prior_instance_attr = route_owner.__dict__.get("_select_experts")
@@ -312,7 +319,6 @@ def measure(
                     _clone(work[1].index_select(0, active_indices[:, 1].to(work[1].device))),
                 )
                 if capture and mode == "fused":
-                    session = getattr(layer, "_megakernel_session", None)
                     weights = getattr(session, "last_route_weights", None)
                     ids = getattr(session, "last_route_ids", None)
                     if not isinstance(weights, torch.Tensor) or not isinstance(ids, torch.Tensor):
@@ -332,6 +338,8 @@ def measure(
                 stats[mode]["consumer_ready_ms"].append(host_ms)
             return values, state, routed, original_indices
         finally:
+            if capture_routes_changed:
+                session.capture_routes = prior_capture_routes
             if capture and saved_route is not None:
                 if had_instance_attr:
                     route_owner._select_experts = prior_instance_attr

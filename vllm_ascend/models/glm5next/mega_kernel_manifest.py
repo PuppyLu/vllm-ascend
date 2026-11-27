@@ -28,8 +28,8 @@ import torch
 import torch.distributed as dist
 from mc2_integration.distributed_mc2 import _tensor_hash, expert_bank_digest
 from mc2_integration.stage24_admission import HEAD_FIELDS, MODEL_FIELDS, NATIVE_SHARED_PROTOCOL, SHARED_FIELDS
-from mc2_integration.torch_acl_bridge import ATTR_NAMES
 
+from vllm_ascend.models.glm5next.mega_kernel_abi import ATTR_NAMES
 from vllm_ascend.models.glm5next.mega_kernel_weights import map_static_weights
 
 

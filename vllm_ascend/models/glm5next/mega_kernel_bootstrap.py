@@ -24,9 +24,10 @@ from typing import Any
 import torch
 import torch.distributed as dist
 from mc2_integration.stage24_admission import NATIVE_SHARED_PROTOCOL, IndependentIdentity, ReviewedIndependentAbi
-from mc2_integration.torch_acl_bridge import ATTR_NAMES, _check_tensor, aligned_copy
+from mc2_integration.torch_acl_bridge import _check_tensor
 from mc2_integration.vllm_mc2_bridge import Mc2SessionConfig
 
+from vllm_ascend.models.glm5next.mega_kernel_abi import ATTR_NAMES, aligned_copy
 from vllm_ascend.models.glm5next.mega_kernel_adapter import (
     DecodeLayerAdapter,
     MegaKernelModelBackend,

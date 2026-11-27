@@ -25,6 +25,17 @@ def agree(err, dev, group, label):
 
 
 collectives.agree_or_abort = agree
+
+
+def enable_capture(session):
+    if session is None or not hasattr(session, "capture_routes"):
+        raise ValueError("MC2 session does not support diagnostic route capture")
+    previous = session.capture_routes
+    session.capture_routes = True
+    return previous
+
+
+collectives.enable_diagnostic_route_capture = enable_capture
 context = install("vllm.forward_context")
 context.get_forward_context = lambda: N()
 install("vllm.distributed")
@@ -109,8 +120,9 @@ layer = N(
     self_attn=N(kv_cache=(torch.zeros(3, 3, 4), torch.zeros(3, 1, 2, 2)), _conv_state_dim_first=False),
     mlp=N(experts=N(routed_experts=routed)),
     _megakernel_stats={"hits": 0},
-    _megakernel_session=N(last_route_weights=None, last_route_ids=None),
+    _megakernel_session=N(last_route_weights=None, last_route_ids=None, capture_routes=False),
 )
+capture_modes = []
 
 
 def actual(positions, hidden, residual, post, comb):
@@ -122,8 +134,10 @@ def actual(positions, hidden, residual, post, comb):
 
 def fused(*args):
     result = actual(*args)
-    layer._megakernel_session.last_route_weights = torch.full((2, 8), 0.125)
-    layer._megakernel_session.last_route_ids = torch.arange(8, dtype=torch.int32).repeat(2, 1)
+    capture_modes.append(layer._megakernel_session.capture_routes)
+    if layer._megakernel_session.capture_routes:
+        layer._megakernel_session.last_route_weights = torch.full((2, 8), 0.125)
+        layer._megakernel_session.last_route_ids = torch.arange(8, dtype=torch.int32).repeat(2, 1)
     layer._megakernel_stats["hits"] += 1
     return result
 
@@ -148,6 +162,8 @@ result = m.measure(
     samples=2,
 )
 assert result["status"] == "PAIRED_LIVE_LAYER_PASS" and result["summary"]["speedup_event_ms"] == 1
+assert capture_modes == [True, False, False, False]
+assert layer._megakernel_session.capture_routes is False
 assert all(torch.equal(t, x) for t, x in zip(layer.self_attn.kv_cache, before))
 assert "_select_experts" not in routed.__dict__
 print("CPU protocol smoke: passed; no A3 or model test")
@@ -164,7 +180,7 @@ def internal_fused(positions, hidden, residual, post, comb):
     return (hidden.clone(), None, None, None)
 
 
-layer._megakernel_session = N(last_route_weights=None, last_route_ids=None)
+layer._megakernel_session = N(last_route_weights=None, last_route_ids=None, capture_routes=False)
 layer._megakernel_benchmark_forward = internal_fused
 result = m.measure(
     layer,
@@ -216,4 +232,5 @@ else:
     raise AssertionError("bad state was accepted")
 assert all(torch.equal(t, x) for t, x in zip(layer.self_attn.kv_cache, before))
 assert "_select_experts" not in routed.__dict__
+assert layer._megakernel_session.capture_routes is False
 print("CPU failure and state-restoration smoke: passed")

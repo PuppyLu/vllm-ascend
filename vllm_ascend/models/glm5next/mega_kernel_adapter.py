@@ -1,24 +1,27 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Experimental vLLM-Ascend GLM5Next eager Decode dispatch.
-
-This file supplies the model-layer dispatch and metadata/state adaptation only.
-``backend`` must be a real, prevalidated MC2 binding, not a fixture. This
-prototype refuses ACL graph, PCP, SP, speculation and unknown metadata.
-First/last mHC handling is implemented but requires device validation. It requires an all-rank admission coordinator;
-coordinator and backend failures terminate the worker and must abort the job.
-No integration or NPU correctness claim is implied.
-"""
+"""Experimental vLLM-Ascend GLM5Next eager Decode dispatch."""
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 import logging
 import threading
 import types
-from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
+
+from vllm_ascend.models.glm5next.mega_kernel_abi import (
+    MC2_INPUT_NAMES,
+    aligned_empty,
+    non_overlapping_positive_strides as _non_overlapping_positive_strides,
+)
+from vllm_ascend.models.glm5next.mega_kernel_collectives import (
+    MegaKernelCollectiveError,
+    agree_or_abort,
+    agree_preflight,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -41,25 +44,11 @@ def benchmark_consumer_ready(outputs: Any) -> None:
     torch.npu.synchronize()
 
 
-def coordinate_layer_preflight(error: Exception | None, pure_decode: bool, device: Any, group: Any) -> bool:
+def coordinate_layer_preflight(
+    error: Exception | None, pure_decode: bool, device: Any, group: Any, *, scratch: Any = None
+) -> bool:
     """Agree on accept, fallback, or abort in one group reduction."""
-    import torch
-    import torch.distributed as dist
-
-    from vllm_ascend.models.glm5next.mega_kernel_collectives import MegaKernelCollectiveError
-
-    status = (
-        2
-        if error is not None and not isinstance(error, UnsupportedDecode)
-        else int(error is not None or not pure_decode)
-    )
-    decision = torch.tensor([status], dtype=torch.int32, device=device)
-    dist.all_reduce(decision, op=dist.ReduceOp.MAX, group=group)
-    result = int(decision.item())
-    if result == 2:
-        cause = error if not isinstance(error, UnsupportedDecode) else None
-        raise MegaKernelCollectiveError("model adapter preflight failed on at least one rank; abort job") from cause
-    return result == 0
+    return agree_preflight(error, pure_decode, device, group, scratch=scratch, unsupported_exc=UnsupportedDecode)
 
 
 @dataclass(frozen=True)
@@ -71,6 +60,8 @@ class DecodeInputs:
     state_indices: Any
     cu_seqlens: Any
     rows: int
+    conv_slots_i64: Any = None
+    recurrent_slots_i64: Any = None
 
 
 def _int_attr(obj: Any, name: str) -> int:
@@ -90,23 +81,11 @@ def _one_dim_slots(tensor: Any, count: int, name: str, torch: Any) -> Any:
     return tensor
 
 
-def _non_overlapping_positive_strides(tensor: Any) -> bool:
-    """Prove that indexed logical elements cannot alias, including across slots.
-
-    This conservative stride-span check accepts transposes and sliced or
-    interleaved pools, while rejecting broadcast and ambiguous overlap. Size-1
-    dimensions do not affect address uniqueness. Storage bounds are enforced
-    by PyTorch when constructing the view.
-    """
-    dimensions = sorted((stride, size) for size, stride in zip(tensor.shape, tensor.stride()) if size > 1)
-    span = 1
-    for stride, size in dimensions:
-        if stride < span:
-            return False
-        # Match the downstream session's conservative stride proof so a
-        # layout rejected there falls back before any collective launch.
-        span = stride * size
-    return True
+def _tensor_version(tensor: Any) -> int | None:
+    try:
+        return tensor._version
+    except RuntimeError:
+        return None
 
 
 def prepare_decode_inputs(
@@ -119,15 +98,11 @@ def prepare_decode_inputs(
     *,
     execution_mode: str,
     scheduler_pure_decode: bool,
+    step_cache: dict[Any, Any] | None = None,
+    cu_seqlens_buf: Any = None,
+    compact_strided_conv: bool = False,
 ) -> DecodeInputs:
-    """Build MC2 state indices from actual KDA metadata in synchronous eager mode.
-
-    Scalar device-to-host checks are deliberate correctness-first admission;
-    their cost belongs in performance reporting. This implementation supports
-    only unpadded rows and does not infer decode from a graph shape. To support
-    graph replay or eliminate these synchronizations, the scheduler must supply
-    a separately validated stable contract and device-side slot handling.
-    """
+    """Build and validate MC2 Decode inputs, sharing host metadata reads within a step."""
     import torch
 
     if scheduler_pure_decode is not True:
@@ -181,14 +156,6 @@ def prepare_decode_inputs(
     query = getattr(metadata, "non_spec_query_start_loc", None)
     if not isinstance(query, torch.Tensor) or query.ndim != 1 or query.numel() != rows + 1:
         raise UnsupportedDecode("decode query boundaries are missing or padded")
-    # Common device integer metadata can share one host read with the slots.
-    # Keep the old path for other devices/dtypes, so no conversion can turn
-    # a fractional or otherwise different boundary into a valid one.
-    packed_query = query.device == hidden_states.device and query.dtype in (torch.int32, torch.int64)
-    if not packed_query:
-        boundaries = query.detach().cpu().tolist()
-        if boundaries != list(range(rows + 1)):
-            raise UnsupportedDecode("not exactly one token for each request")
     conv_slots = _one_dim_slots(getattr(conv_meta, "cache_indices", None), rows, "conv slots", torch)
     recurrent_slots = _one_dim_slots(
         getattr(metadata, "non_spec_state_indices_tensor", None), rows, "recurrent slots", torch
@@ -216,70 +183,245 @@ def prepare_decode_inputs(
         or recurrent_state.device != hidden_states.device
     ):
         raise UnsupportedDecode("KDA state dtype, shape or device differs from the MC2 ABI")
-    # The session copies only active slots into its own contiguous MC2 state.
-    # A transpose of a contiguous physical cache has no self-overlap and can
-    # be updated through the view after a successful launch. Keep the old
-    # whole-pool conversion for other, unverified non-contiguous layouts.
     conv_writeback = None
     transposed_contiguous = getattr(attn, "_conv_state_dim_first", False) and cache[0].is_contiguous()
     if not conv_state.is_contiguous() and not transposed_contiguous:
-        conv_writeback = conv_state
-        conv_state = conv_state.contiguous()
+        if not (compact_strided_conv and _non_overlapping_positive_strides(conv_state)):
+            conv_writeback = conv_state
+            conv_state = conv_state.contiguous()
     if not _non_overlapping_positive_strides(recurrent_state):
         raise UnsupportedDecode("recurrent state layout may overlap")
-    # One host transfer retains the full signed width of both model slot
-    # tensors; converting to the ABI's int32 before validation could wrap.
-    slot_pairs = torch.stack((conv_slots.to(torch.int64), recurrent_slots.to(torch.int64)), dim=1)
-    if packed_query:
-        packed = torch.cat((query.to(torch.int64), slot_pairs.reshape(-1)))
-        metadata_values = packed.detach().cpu().tolist()
-        if metadata_values[: rows + 1] != list(range(rows + 1)):
+
+    conv_cap = int(conv_state.shape[0])
+    rec_cap = int(recurrent_state.shape[0])
+    cache_key = (
+        query.data_ptr(),
+        _tensor_version(query),
+        query.dtype,
+        query.device,
+        conv_slots.data_ptr(),
+        _tensor_version(conv_slots),
+        conv_slots.dtype,
+        conv_slots.stride(0),
+        recurrent_slots.data_ptr(),
+        _tensor_version(recurrent_slots),
+        recurrent_slots.dtype,
+        recurrent_slots.stride(0),
+        rows,
+        conv_cap,
+        rec_cap,
+        hidden_states.device,
+    )
+    if step_cache is not None and cache_key in step_cache:
+        cached = step_cache[cache_key]
+        return DecodeInputs(
+            metadata,
+            conv_state,
+            conv_writeback,
+            recurrent_state,
+            cached["state_indices"],
+            cached["cu_seqlens"],
+            rows,
+            cached["conv_slots_i64"],
+            cached["recurrent_slots_i64"],
+        )
+
+    packed_query = query.device == hidden_states.device and query.dtype in (torch.int32, torch.int64)
+    if not packed_query:
+        boundaries = query.detach().cpu().tolist()
+        if boundaries != list(range(rows + 1)):
             raise UnsupportedDecode("not exactly one token for each request")
-        flat_pairs = metadata_values[rows + 1 :]
-        host_pairs = list(zip(flat_pairs[::2], flat_pairs[1::2]))
+
+    conv_slots_i64 = conv_slots.to(torch.int64)
+    same_slots = (
+        conv_slots.data_ptr() == recurrent_slots.data_ptr()
+        and conv_slots.dtype == recurrent_slots.dtype
+        and tuple(conv_slots.stride()) == tuple(recurrent_slots.stride())
+    )
+    rec_slots_i64 = conv_slots_i64 if same_slots else recurrent_slots.to(torch.int64)
+    slot_pairs = torch.stack((conv_slots_i64, rec_slots_i64), dim=1)
+    if packed_query:
+        if same_slots:
+            packed = torch.cat((query.to(torch.int64), conv_slots_i64))
+            metadata_values = packed.detach().cpu().tolist()
+            if metadata_values[: rows + 1] != list(range(rows + 1)):
+                raise UnsupportedDecode("not exactly one token for each request")
+            vals = metadata_values[rows + 1 :]
+            if len(set(vals)) != rows or any(v < 0 or v >= min(conv_cap, rec_cap) for v in vals):
+                raise UnsupportedDecode("conv/recurrent slots contain padding, invalid or duplicate state")
+        else:
+            packed = torch.cat((query.to(torch.int64), slot_pairs.reshape(-1)))
+            metadata_values = packed.detach().cpu().tolist()
+            if metadata_values[: rows + 1] != list(range(rows + 1)):
+                raise UnsupportedDecode("not exactly one token for each request")
+            flat_pairs = metadata_values[rows + 1 :]
+            conv_vals = flat_pairs[::2]
+            rec_vals = flat_pairs[1::2]
+            for name, capacity, vals in (
+                ("conv", conv_cap, conv_vals),
+                ("recurrent", rec_cap, rec_vals),
+            ):
+                if any(v < 0 or v >= capacity for v in vals) or len(set(vals)) != rows:
+                    raise UnsupportedDecode(f"{name} slots contain padding, invalid or duplicate state")
     else:
         host_pairs = slot_pairs.detach().cpu().tolist()
-    for column, name, capacity in (
-        (0, "conv", conv_state.shape[0]),
-        (1, "recurrent", recurrent_state.shape[0]),
-    ):
-        vals = [pair[column] for pair in host_pairs]
-        if any(v < 0 or v >= capacity for v in vals) or len(set(vals)) != rows:
-            raise UnsupportedDecode(f"{name} slots contain padding, invalid or duplicate state")
+        for column, name, capacity in ((0, "conv", conv_cap), (1, "recurrent", rec_cap)):
+            vals = [pair[column] for pair in host_pairs]
+            if any(v < 0 or v >= capacity for v in vals) or len(set(vals)) != rows:
+                raise UnsupportedDecode(f"{name} slots contain padding, invalid or duplicate state")
+
     indices = slot_pairs.to(dtype=torch.int32).contiguous()
-    # This immutable template is copied into the session's bound input before
-    # launch. Layer execution is serialized; include the stream in the cache
-    # key so another stream never consumes a newly allocated NPU tensor without
-    # inheriting its initialization dependency.
-    device = hidden_states.device
-    stream = int(torch.npu.current_stream(device).npu_stream) if device.type == "npu" else None
-    cache_key = (device, stream)
-    template = getattr(layer, "_megakernel_seq_template", None)
-    if template is None or template[0] != cache_key:
-        template = (cache_key, torch.tensor([0, 1], dtype=torch.int32, device=device))
-        layer._megakernel_seq_template = template
-    cu_seqlens = template[1]
-    return DecodeInputs(metadata, conv_state, conv_writeback, recurrent_state, indices, cu_seqlens, rows)
+    if cu_seqlens_buf is not None:
+        cu_seqlens = cu_seqlens_buf
+    elif step_cache is not None:
+        cu_key = ("cu_seqlens", hidden_states.device)
+        cu_seqlens = step_cache.get(cu_key)
+        if cu_seqlens is None:
+            cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device=hidden_states.device)
+            step_cache[cu_key] = cu_seqlens
+    else:
+        device = hidden_states.device
+        stream = int(torch.npu.current_stream(device).npu_stream) if device.type == "npu" else None
+        cache_key = (device, stream)
+        template = getattr(layer, "_megakernel_seq_template", None)
+        if template is None or template[0] != cache_key:
+            template = (cache_key, torch.tensor([0, 1], dtype=torch.int32, device=device))
+            layer._megakernel_seq_template = template
+        cu_seqlens = template[1]
+
+    if step_cache is not None:
+        step_cache.setdefault("_refs", []).append((cache[0], cache[1], query, conv_slots, recurrent_slots))
+        step_cache[cache_key] = {
+            "state_indices": indices,
+            "cu_seqlens": cu_seqlens,
+            "conv_slots_i64": conv_slots_i64,
+            "recurrent_slots_i64": rec_slots_i64,
+        }
+    return DecodeInputs(
+        metadata,
+        conv_state,
+        conv_writeback,
+        recurrent_state,
+        indices,
+        cu_seqlens,
+        rows,
+        conv_slots_i64,
+        rec_slots_i64,
+    )
+
+
+class StepDecodeCoordinator:
+    """Coordinate step-level preflight (1 collective) and deferred state commit across target layers."""
+
+    def __init__(
+        self,
+        *,
+        gate: Any,
+        pool: Any,
+        control_device: Any,
+        control_group: Any,
+        layer_entries: list[tuple[Any, Any]],
+        defer_state_commit: bool = True,
+    ):
+        self.gate = gate
+        self.pool = pool
+        self.control_device = control_device
+        self.control_group = control_group
+        self.layer_entries = list(layer_entries)
+        self.first_layer_idx = self.layer_entries[0][0].layer_idx
+        self.last_layer_idx = self.layer_entries[-1][0].layer_idx
+        self.defer_state_commit = bool(defer_state_commit)
+        self._first_inputs_cache: dict[int, DecodeInputs] = {}
+
+    def on_step_exit(self, failed: bool) -> None:
+        self._first_inputs_cache.clear()
+        if self.pool is not None and self.pool.has_pending():
+            self.pool.abort_step(mark_failed=True)
+            if not failed:
+                raise MegaKernelCollectiveError(
+                    "MC2 step exited with uncommitted deferred state; abort distributed job"
+                )
+
+    def preflight_all_layers(
+        self,
+        *,
+        first_layer: Any,
+        forward_context: Any,
+        hidden_states: Any,
+        residual: Any,
+        post: Any,
+        comb: Any,
+        execution_mode: str,
+        scheduler_pure_decode: bool,
+        step_cache: dict[Any, Any] | None,
+    ) -> tuple[bool, DecodeInputs | None, Exception | None]:
+        """Validate all target layers and prepare geometry across ranks before entering HCCL."""
+        self._first_inputs_cache.clear()
+        first_inputs = None
+        local_error: Exception | None = None
+        try:
+            import torch
+
+            rows = int(hidden_states.shape[0]) if hasattr(hidden_states, "shape") else 0
+            stream = torch.npu.current_stream(hidden_states.device) if rows > 0 else None
+            for layer, backend in self.layer_entries:
+                if layer is first_layer:
+                    decoded = prepare_decode_inputs(
+                        layer,
+                        forward_context,
+                        hidden_states,
+                        residual,
+                        post,
+                        comb,
+                        execution_mode=execution_mode,
+                        scheduler_pure_decode=scheduler_pure_decode,
+                        step_cache=step_cache,
+                        compact_strided_conv=hasattr(backend.session, "forward_layer"),
+                    )
+                    backend.validate(layer, decoded, hidden_states, residual, post, comb)
+                    first_inputs = decoded
+                else:
+                    # Validate non-first layer metadata & KV cache layout using dummy placeholders
+                    # matching first layer's incoming mHC shapes.
+                    decoded = prepare_decode_inputs(
+                        layer,
+                        forward_context,
+                        hidden_states,
+                        hidden_states,
+                        hidden_states,
+                        hidden_states,
+                        execution_mode=execution_mode,
+                        scheduler_pure_decode=scheduler_pure_decode,
+                        step_cache=step_cache,
+                        compact_strided_conv=hasattr(backend.session, "forward_layer"),
+                    )
+                    backend.validate_static_once(layer)
+                if hasattr(backend.session, "ensure_geometry"):
+                    backend.session.ensure_geometry(decoded.rows, stream)
+        except Exception as exc:
+            local_error = exc
+        scratch = self.pool.get_preflight_scratch() if self.pool is not None else None
+        accepted = coordinate_layer_preflight(
+            local_error,
+            scheduler_pure_decode,
+            self.control_device,
+            self.control_group,
+            scratch=scratch,
+        )
+        if not accepted:
+            self._first_inputs_cache.clear()
+            return False, None, local_error
+        if local_error is not None or first_inputs is None:
+            raise MegaKernelCollectiveError("coordinator accepted an unsupported step; abort job")
+        return True, first_inputs, None
+
+    def finalize_step(self) -> None:
+        if self.defer_state_commit and self.pool is not None:
+            self.pool.finalize_step(self.control_device, self.control_group)
 
 
 class DecodeLayerAdapter:
-    """Wrap one existing layer, coordinating the decision before any MC2 launch.
-
-    ``coordinate(layer, local_error) -> bool`` must run on all members and
-    return True only if every rank has an identical, supported call contract.
-    It must return False to all ranks for any local error. It must raise/job
-    abort on missing members rather than allow a unilateral fallback.
-
-    ``backend(layer, positions, hidden_states, residual, post, comb, decode)``
-    must execute the real full-layer MC2 ABI with matching weights and groups,
-    and must return the four output values after required consumer visibility.
-    MC2 updates decode.conv_state / recurrent_state exactly once. Failures after
-    entering backend MUST propagate; do not fall back/retry on one rank.
-    ``execution_mode()`` must identify actual eager, not just an intended mode.
-    ``decode_evidence(layer)`` must use the current scheduler metadata to prove
-    that every active request is in generation phase and has one token; GDN
-    metadata alone can reclassify single-token prompt tails as decode.
-    """
+    """Wrap one existing layer, coordinating the decision before any MC2 launch."""
 
     def __init__(
         self,
@@ -288,6 +430,7 @@ class DecodeLayerAdapter:
         execution_mode: Callable[[], str],
         decode_evidence: Callable[[Any], bool],
         benchmark: Callable[..., bool] | None = None,
+        coordinator: StepDecodeCoordinator | None = None,
     ):
         if not all(callable(f) for f in (backend, coordinate, execution_mode, decode_evidence)):
             raise TypeError("backend, coordinator and execution mode are required")
@@ -296,6 +439,7 @@ class DecodeLayerAdapter:
         if benchmark is not None and not callable(benchmark):
             raise TypeError("benchmark must be callable")
         self.benchmark = benchmark
+        self.coordinator = coordinator
         self._benchmark_active = False
         self._benchmark_done = False
 
@@ -313,55 +457,118 @@ class DecodeLayerAdapter:
         ):
             from vllm.forward_context import get_forward_context
 
-            # The runner already agreed this step across the control group.
-            # Prefill/dummy paths do not issue per-layer HCCL collectives.
             if not adapter.decode_evidence(this):
                 stats["nondecode"] += 1
                 return original(positions, hidden_states, residual, post, comb)
-            local_error = None
-            inputs = None
-            try:
-                inputs = prepare_decode_inputs(
-                    this,
-                    get_forward_context(),
-                    hidden_states,
-                    residual,
-                    post,
-                    comb,
-                    execution_mode=adapter.execution_mode(),
-                    scheduler_pure_decode=adapter.decode_evidence(this),
-                )
-            except Exception as exc:
-                local_error = exc
-            # The backend must validate all fixed weights and group mapping
-            # BEFORE this agreement. It must not start any collective here.
-            if local_error is None:
+
+            coord = adapter.coordinator
+            forward_context = get_forward_context()
+            use_step_fast_path = coord is not None and not adapter._benchmark_active
+            step_cache = coord.gate.current_step_cache() if coord is not None and hasattr(coord.gate, "current_step_cache") else None
+            use_compact_conv = hasattr(getattr(adapter.backend, "session", None), "forward_layer")
+
+            if use_step_fast_path:
+                assert coord is not None
+                if hasattr(coord.gate, "register_step_cleanup"):
+                    coord.gate.register_step_cleanup(coord.on_step_exit)
+                verdict = coord.gate.get_step_preflight()
+                if verdict is None:
+                    accepted, inputs, local_error = coord.preflight_all_layers(
+                        first_layer=this,
+                        forward_context=forward_context,
+                        hidden_states=hidden_states,
+                        residual=residual,
+                        post=post,
+                        comb=comb,
+                        execution_mode=adapter.execution_mode(),
+                        scheduler_pure_decode=adapter.decode_evidence(this),
+                        step_cache=step_cache,
+                    )
+                    coord.gate.set_step_preflight("accepted" if accepted else "fallback")
+                    if not accepted:
+                        stats["group_fallback"] += 1
+                        if stats["group_fallback"] == 1:
+                            logger.warning(
+                                "MegaKernel step used group fallback at layer %s; local reason: %s",
+                                this.layer_idx,
+                                local_error,
+                            )
+                        return original(positions, hidden_states, residual, post, comb)
+                elif verdict == "fallback":
+                    stats["group_fallback"] += 1
+                    return original(positions, hidden_states, residual, post, comb)
+                elif verdict == "accepted":
+                    try:
+                        inputs = prepare_decode_inputs(
+                            this,
+                            forward_context,
+                            hidden_states,
+                            residual,
+                            post,
+                            comb,
+                            execution_mode=adapter.execution_mode(),
+                            scheduler_pure_decode=adapter.decode_evidence(this),
+                            step_cache=step_cache,
+                            compact_strided_conv=use_compact_conv,
+                        )
+                        adapter.backend.validate(this, inputs, hidden_states, residual, post, comb)
+                    except Exception as exc:
+                        raise MegaKernelCollectiveError(
+                            f"MegaKernel mid-step failure on layer {this.layer_idx} after group accept; abort job"
+                        ) from exc
+                else:
+                    raise RuntimeError(f"unknown step preflight verdict: {verdict}")
+            else:
+                local_error = None
+                inputs = None
                 try:
-                    adapter.backend.validate(this, inputs, hidden_states, residual, post, comb)
+                    inputs = prepare_decode_inputs(
+                        this,
+                        forward_context,
+                        hidden_states,
+                        residual,
+                        post,
+                        comb,
+                        execution_mode=adapter.execution_mode(),
+                        scheduler_pure_decode=adapter.decode_evidence(this),
+                        compact_strided_conv=use_compact_conv,
+                    )
                 except Exception as exc:
                     local_error = exc
-            accepted = adapter.coordinate(this, local_error)
-            if type(accepted) is not bool:
-                raise RuntimeError("coordinator returned no definite decision")
-            if not accepted:
-                stats["group_fallback"] += 1
-                if stats["group_fallback"] == 1:
-                    logger.warning(
-                        "MegaKernel layer %s used group fallback; local reason: %s", this.layer_idx, local_error
-                    )
-                return original(positions, hidden_states, residual, post, comb)
-            if local_error is not None or inputs is None:
-                raise RuntimeError("coordinator accepted an unsupported local call")
+                if local_error is None:
+                    try:
+                        adapter.backend.validate(this, inputs, hidden_states, residual, post, comb)
+                    except Exception as exc:
+                        local_error = exc
+                accepted = adapter.coordinate(this, local_error)
+                if type(accepted) is not bool:
+                    raise RuntimeError("coordinator returned no definite decision")
+                if not accepted:
+                    stats["group_fallback"] += 1
+                    if stats["group_fallback"] == 1:
+                        logger.warning(
+                            "MegaKernel layer %s used group fallback; local reason: %s", this.layer_idx, local_error
+                        )
+                    return original(positions, hidden_states, residual, post, comb)
+                if local_error is not None or inputs is None:
+                    raise RuntimeError("coordinator accepted an unsupported local call")
+
             if adapter.benchmark is not None and not adapter._benchmark_active and not adapter._benchmark_done:
                 adapter._benchmark_active = True
+                saved_pending = None
+                if coord is not None and coord.pool is not None:
+                    saved_pending = list(coord.pool._pending)
+                    coord.pool._pending = []
                 try:
                     completed = adapter.benchmark(this, positions, hidden_states, residual, post, comb, inputs)
                     if type(completed) is not bool:
                         raise RuntimeError("single-layer benchmark must return a completion flag")
                     adapter._benchmark_done = completed
                 finally:
+                    if saved_pending is not None:
+                        coord.pool._pending = saved_pending
                     adapter._benchmark_active = False
-            # Match upstream kda.py KV connector ordering and attention fence.
+
             from vllm_ascend.models.glm5next.kda import (
                 maybe_save_kv_layer_to_connector,
                 record_attention_compute_start,
@@ -370,10 +577,39 @@ class DecodeLayerAdapter:
 
             wait_for_kv_layer_from_connector(this.self_attn.prefix)
             record_attention_compute_start()
-            out = adapter.backend(this, positions, hidden_states, residual, post, comb, inputs)
+            if adapter._benchmark_active:
+                out = adapter.backend(
+                    this,
+                    positions,
+                    hidden_states,
+                    residual,
+                    post,
+                    comb,
+                    inputs,
+                    defer_commit=False,
+                    capture_routes=None,
+                    clone_outputs=True,
+                )
+            elif coord is not None:
+                out = adapter.backend(
+                    this,
+                    positions,
+                    hidden_states,
+                    residual,
+                    post,
+                    comb,
+                    inputs,
+                    defer_commit=coord.defer_state_commit,
+                    capture_routes=None,
+                    clone_outputs=False,
+                )
+            else:
+                out = adapter.backend(this, positions, hidden_states, residual, post, comb, inputs)
             if not isinstance(out, tuple) or len(out) != 4:
                 raise RuntimeError("MC2 backend did not return the layer's four values")
             maybe_save_kv_layer_to_connector(this.self_attn.prefix, [])
+            if use_step_fast_path and coord is not None and this.layer_idx == coord.last_layer_idx:
+                coord.finalize_step()
             stats["hits"] += 1
             if stats["hits"] == 1:
                 logger.info("MegaKernel layer %s first successful Decode call", this.layer_idx)
@@ -383,8 +619,6 @@ class DecodeLayerAdapter:
             this: Any, positions: Any, hidden_states: Any, residual: Any = None, post: Any = None, comb: Any = None
         ):
             if not execution_lock.acquire(blocking=False):
-                # A local wait can desynchronize collective order across ranks.
-                # Abort the worker instead of queueing a concurrent model call.
                 raise RuntimeError("concurrent MegaKernel layer calls are unsupported; abort the distributed job")
             try:
                 return forward_impl(this, positions, hidden_states, residual, post, comb)
@@ -393,8 +627,6 @@ class DecodeLayerAdapter:
 
         layer._megakernel_original_forward = original
         layer._megakernel_session = getattr(adapter.backend, "session", None)
-        # The diagnostic replay runs synchronously inside the already-held
-        # layer lock; only that private path may call the implementation.
         layer._megakernel_benchmark_forward = types.MethodType(forward_impl, layer)
         layer.forward = types.MethodType(forward, layer)
 
@@ -416,7 +648,6 @@ def _copy_live_kda_slots(cache: Any, state_indices: Any) -> tuple[Any, Any]:
 
 def _aligned_mhc_buffers(rows: int, dtype: Any, device: Any, aligned_empty: Callable[..., Any]) -> tuple[Any, Any]:
     """Allocate disjoint, independently aligned post and combination buffers."""
-    # Each FP32 plane is rows * 512 bytes, so both views are aligned.
     mixing = aligned_empty((2, rows, 128), dtype, device)
     mixing.zero_()
     return mixing[0], mixing[1]
@@ -435,7 +666,6 @@ class _MhcBufferCache:
             self.buffers = _aligned_mhc_buffers(rows, dtype, device, aligned_empty)
             self.key = key
         else:
-            # Preserve the previous zero-padding contract on both planes.
             for value in self.buffers:
                 value.zero_()
         return self.buffers
@@ -473,13 +703,7 @@ def _validate_internal_router(layer: Any, router: Any) -> None:
 
 
 class MegaKernelModelBackend:
-    """Assemble real model tensors and invoke a group-bound MC2 session.
-
-    Static weights and attrs must come from the checked checkpoint mapper and
-    reviewed generated ABI. The session is supplied by the operator repository.
-    The identity factory derives the current layer/step and trusted checkpoint
-    identity; no locally invented cross-rank step counter is used here.
-    """
+    """Assemble real model tensors and invoke a group-bound MC2 session."""
 
     def __init__(
         self,
@@ -493,27 +717,19 @@ class MegaKernelModelBackend:
         self.session, self.static_weights, self.attrs = session, dict(static_weights), dict(attrs)
         self.identity_factory = identity_factory
         self._mhc_buffer_cache = _MhcBufferCache()
+        self._static_validated = False
 
-    def validate(
-        self, layer: Any, decode: DecodeInputs, hidden_states: Any, residual: Any, post: Any, comb: Any
-    ) -> None:
-        from vllm.distributed.kv_transfer import has_kv_transfer_group
+    def validate_static_once(self, layer: Any) -> None:
+        if self._static_validated:
+            return
+        self.validate_static(layer)
+        self._static_validated = True
 
-        rows = decode.rows
-        if rows < 1 or not self.static_weights:
-            raise UnsupportedDecode("MC2 static weights or active rows are unavailable")
+    def validate_static(self, layer: Any) -> None:
+        if not self.static_weights:
+            raise UnsupportedDecode("MC2 static weights are unavailable")
         if self.attrs.get("stage_limit") != self.session.bridge.stage_limit:
             raise UnsupportedDecode("MC2 stage limit differs from the configured bridge")
-        if tuple(hidden_states.shape) != (rows, 4096):
-            raise UnsupportedDecode("hidden state does not match the MC2 ABI")
-        first = layer.layer_idx == 0 and post is None
-        if not first:
-            if tuple(residual.shape) != (rows, 4, 4096):
-                raise UnsupportedDecode("mHC residual does not match the MC2 ABI")
-            if tuple(post.shape) != (rows, 4, 1) or tuple(comb.shape) != (rows, 4, 4):
-                raise UnsupportedDecode("incoming mHC mixing tensors do not match the model contract")
-        if has_kv_transfer_group():
-            raise UnsupportedDecode("MC2 adapter does not support a KV transfer connector")
         runner = layer.mlp.experts
         routed = getattr(runner, "routed_experts", None)
         if not callable(getattr(routed, "_select_experts", None)):
@@ -539,13 +755,76 @@ class MegaKernelModelBackend:
         ):
             raise UnsupportedDecode("model expert activation clamp differs from MC2 limit 10")
 
+    def validate(
+        self, layer: Any, decode: DecodeInputs, hidden_states: Any, residual: Any, post: Any, comb: Any
+    ) -> None:
+        from vllm.distributed.kv_transfer import has_kv_transfer_group
+
+        rows = decode.rows
+        if rows < 1:
+            raise UnsupportedDecode("MC2 active rows are unavailable")
+        self.validate_static_once(layer)
+        if tuple(hidden_states.shape) != (rows, 4096):
+            raise UnsupportedDecode("hidden state does not match the MC2 ABI")
+        first = layer.layer_idx == 0 and post is None
+        if not first:
+            if tuple(residual.shape) != (rows, 4, 4096):
+                raise UnsupportedDecode("mHC residual does not match the MC2 ABI")
+            if tuple(post.shape) != (rows, 4, 1) or tuple(comb.shape) != (rows, 4, 4):
+                raise UnsupportedDecode("incoming mHC mixing tensors do not match the model contract")
+        if has_kv_transfer_group():
+            raise UnsupportedDecode("MC2 adapter does not support a KV transfer connector")
+
     def __call__(
-        self, layer: Any, positions: Any, hidden_states: Any, residual: Any, post: Any, comb: Any, decode: DecodeInputs
+        self,
+        layer: Any,
+        positions: Any,
+        hidden_states: Any,
+        residual: Any,
+        post: Any,
+        comb: Any,
+        decode: DecodeInputs,
+        *,
+        defer_commit: bool | None = None,
+        capture_routes: bool | None = None,
+        clone_outputs: bool = False,
     ) -> tuple[Any, Any, Any, Any]:
+        del positions
         import torch
 
-        from vllm_ascend.models.glm5next.mega_kernel_abi import MC2_INPUT_NAMES, aligned_empty
-        from vllm_ascend.models.glm5next.mega_kernel_collectives import agree_or_abort
+        if hasattr(self.session, "forward_layer"):
+            conv_slots_i64 = (
+                decode.conv_slots_i64
+                if decode.conv_slots_i64 is not None
+                else decode.state_indices[:, 0].to(dtype=torch.int64)
+            )
+            rec_slots_i64 = (
+                decode.recurrent_slots_i64
+                if decode.recurrent_slots_i64 is not None
+                else decode.state_indices[:, 1].to(dtype=torch.int64)
+            )
+            result = self.session.forward_layer(
+                hidden_states=hidden_states,
+                residual=residual,
+                post=post,
+                comb=comb,
+                conv_state=decode.conv_state,
+                recurrent_state=decode.recurrent_state,
+                conv_slots_i64=conv_slots_i64,
+                rec_slots_i64=rec_slots_i64,
+                is_first_layer=(layer.layer_idx == 0 and post is None),
+                conv_writeback=decode.conv_writeback,
+                capture_routes=capture_routes,
+                defer_commit=defer_commit,
+                clone_outputs=clone_outputs,
+            )
+            if layer.layer_idx == layer.num_hidden_layers - 1:
+                from vllm_ascend.models.glm5next.ops.mhc_ops import hc_contract
+
+                output, ffn_residual, ffn_post, ffn_comb = result
+                output = hc_contract(layer.hc_post(output, ffn_residual, ffn_post, ffn_comb), layer.n)
+                return output, None, None, None
+            return result
 
         rows = decode.rows
         error = None
@@ -554,19 +833,15 @@ class MegaKernelModelBackend:
                 rows, torch.float32, hidden_states.device, aligned_empty
             )
             if layer.layer_idx == 0 and post is None:
-                # HcPost(identity, zero) reproduces the first layer's hc_expand.
                 model_residual = hidden_states.unsqueeze(1).expand(-1, 4, -1).contiguous()
                 model_post_out = torch.zeros_like(hidden_states)
-                identity = torch.eye(4, dtype=torch.float32, device=hidden_states.device)
-                padded_comb[:, :16].copy_(identity.reshape(1, 16).expand(rows, -1))
+                identity_eye = torch.eye(4, dtype=torch.float32, device=hidden_states.device)
+                padded_comb[:, :16].copy_(identity_eye.reshape(1, 16).expand(rows, -1))
             else:
                 model_residual = residual
                 model_post_out = hidden_states
                 padded_post[:, :4].copy_(post.reshape(rows, 4))
                 padded_comb[:, :16].copy_(comb.reshape(rows, 16))
-            # The session copies live slots into its own aligned, contiguous
-            # provisional state and commits those slots on success. Model
-            # state therefore need not itself be aligned or contiguous.
             inputs = {name: None for name in MC2_INPUT_NAMES}
             inputs.update(self.static_weights)
             inputs.update(
@@ -589,11 +864,7 @@ class MegaKernelModelBackend:
         )
         if error is not None:
             raise error
-        # The enclosing wrapper validated the query and slots and all ranks
-        # agreed before entering MC2. The session owns its executor bindings.
         result = self.session.forward(inputs, self.attrs, identity, validated_step=True)
-        # Every rank enters the post-commit agreement, even when only some
-        # layouts require a separate convolution-state copy.
         error = None
         try:
             if decode.conv_writeback is not None:

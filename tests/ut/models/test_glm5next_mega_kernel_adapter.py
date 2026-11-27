@@ -13,11 +13,26 @@ from unittest.mock import patch
 
 import torch
 
-MODULE_PATH = Path(__file__).resolve().parents[3] / "vllm_ascend/models/glm5next/mega_kernel_adapter.py"
-spec = importlib.util.spec_from_file_location("glm5next_mega_kernel_adapter_cpu_test", MODULE_PATH)
-module = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = module
-spec.loader.exec_module(module)
+def _load_adapter_module():
+    glm5next_dir = Path(__file__).resolve().parents[3] / "vllm_ascend/models/glm5next"
+    if importlib.util.find_spec("vllm") is not None:
+        return importlib.import_module("vllm_ascend.models.glm5next.mega_kernel_adapter")
+    modules = {}
+    for pkg in ("vllm_ascend", "vllm_ascend.models", "vllm_ascend.models.glm5next"):
+        mod = ModuleType(pkg)
+        mod.__path__ = [str(glm5next_dir)]
+        modules[pkg] = mod
+    for mod_name in ("mega_kernel_abi", "mega_kernel_collectives", "mega_kernel_adapter"):
+        fq = f"vllm_ascend.models.glm5next.{mod_name}"
+        spec = importlib.util.spec_from_file_location(fq, glm5next_dir / f"{mod_name}.py")
+        loaded = importlib.util.module_from_spec(spec)
+        modules[fq] = loaded
+        with patch.dict(sys.modules, modules):
+            spec.loader.exec_module(loaded)
+    return modules["vllm_ascend.models.glm5next.mega_kernel_adapter"]
+
+
+module = _load_adapter_module()
 UnsupportedDecode = module.UnsupportedDecode
 prepare_decode_inputs = module.prepare_decode_inputs
 
@@ -324,7 +339,7 @@ class DecodeMetadataTests(unittest.TestCase):
         torch.testing.assert_close(original[[1, 3]], decoded.conv_state[[1, 3]].transpose(-1, -2))
 
     def test_backend_commits_only_live_slots_and_keeps_group_agreement(self):
-        names = (
+        dynamic_names = {
             "x",
             "post_h_out",
             "post_h_post",
@@ -335,12 +350,8 @@ class DecodeMetadataTests(unittest.TestCase):
             "state_indices",
             "external_route_ids",
             "external_route_weights",
-            "static",
-        )
-        abi = ModuleType("vllm_ascend.models.glm5next.mega_kernel_abi")
-        abi.MC2_INPUT_NAMES = names
-        abi.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
-        collectives = ModuleType("vllm_ascend.models.glm5next.mega_kernel_collectives")
+        }
+        static_weights = {name: 1 for name in module.MC2_INPUT_NAMES if name not in dynamic_names}
         votes = []
 
         def agree(error, device, group, phase):
@@ -348,11 +359,6 @@ class DecodeMetadataTests(unittest.TestCase):
             if error:
                 raise error
 
-        collectives.agree_or_abort = agree
-        modules = {
-            "vllm_ascend.models.glm5next.mega_kernel_abi": abi,
-            "vllm_ascend.models.glm5next.mega_kernel_collectives": collectives,
-        }
         syncs = []
         fake_npu = NS(current_stream=lambda device: NS(synchronize=lambda: syncs.append("sync")))
 
@@ -379,8 +385,8 @@ class DecodeMetadataTests(unittest.TestCase):
                     return (self.hidden, self.residual, self.post, self.comb)
 
                 session = NS(forward=forward, config=NS(control_device="cpu", control_group=None))
-                backend = module.MegaKernelModelBackend(session, {"static": 1}, {}, lambda *a: "identity")
-                with patch.dict(sys.modules, modules), patch.object(torch, "npu", fake_npu, create=True):
+                backend = module.MegaKernelModelBackend(session, static_weights, {}, lambda *a: "identity")
+                with patch.object(module, "agree_or_abort", agree), patch.object(torch, "npu", fake_npu, create=True):
                     backend(self.layer, None, self.hidden, self.residual, self.post, self.comb, decoded)
                 self.assertTrue(torch.all(conv[[1, 3]] == 3))
                 self.assertEqual(conv[[0, 2]].count_nonzero().item(), 0)
@@ -390,7 +396,7 @@ class DecodeMetadataTests(unittest.TestCase):
                 self.assertEqual(syncs, ["sync"] if fallback else [])
 
     def test_backend_failure_does_not_publish_staged_cache(self):
-        names = (
+        dynamic_names = {
             "x",
             "post_h_out",
             "post_h_post",
@@ -401,17 +407,8 @@ class DecodeMetadataTests(unittest.TestCase):
             "state_indices",
             "external_route_ids",
             "external_route_weights",
-            "static",
-        )
-        abi = ModuleType("vllm_ascend.models.glm5next.mega_kernel_abi")
-        abi.MC2_INPUT_NAMES = names
-        abi.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
-        collectives = ModuleType("vllm_ascend.models.glm5next.mega_kernel_collectives")
-        collectives.agree_or_abort = lambda error, *args: None
-        modules = {
-            "vllm_ascend.models.glm5next.mega_kernel_abi": abi,
-            "vllm_ascend.models.glm5next.mega_kernel_collectives": collectives,
         }
+        static_weights = {name: 1 for name in module.MC2_INPUT_NAMES if name not in dynamic_names}
         physical = torch.zeros(8, 384, 3, dtype=torch.bfloat16)[::2]
         self.layer.self_attn.kv_cache = (physical, torch.zeros(4, 1, 128, 128))
         self.layer.self_attn._conv_state_dim_first = True
@@ -422,8 +419,11 @@ class DecodeMetadataTests(unittest.TestCase):
             raise RuntimeError("distributed launch failed")
 
         session = NS(forward=fail, config=NS(control_device="cpu", control_group=None))
-        backend = module.MegaKernelModelBackend(session, {"static": 1}, {}, lambda *a: "identity")
-        with patch.dict(sys.modules, modules), self.assertRaisesRegex(RuntimeError, "distributed launch failed"):
+        backend = module.MegaKernelModelBackend(session, static_weights, {}, lambda *a: "identity")
+        with (
+            patch.object(module, "agree_or_abort", lambda error, *a: None),
+            self.assertRaisesRegex(RuntimeError, "distributed launch failed"),
+        ):
             backend(self.layer, None, self.hidden, self.residual, self.post, self.comb, decoded)
         self.assertEqual(physical.count_nonzero().item(), 0)
 
@@ -474,7 +474,7 @@ class DecodeMetadataTests(unittest.TestCase):
         module._validate_internal_router(layer, grouped)
 
     def test_internal_routing_passes_validated_inputs_without_replaying_prefix(self):
-        names = (
+        dynamic_names = {
             "x",
             "post_h_out",
             "post_h_post",
@@ -485,14 +485,9 @@ class DecodeMetadataTests(unittest.TestCase):
             "state_indices",
             "external_route_ids",
             "external_route_weights",
-            "static",
-        )
-        abi = ModuleType("vllm_ascend.models.glm5next.mega_kernel_abi")
-        abi.MC2_INPUT_NAMES = names
-        abi.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
-        collectives = ModuleType("vllm_ascend.models.glm5next.mega_kernel_collectives")
+        }
+        static_weights = {name: 1 for name in module.MC2_INPUT_NAMES if name not in dynamic_names}
         votes = []
-        collectives.agree_or_abort = lambda error, *a: votes.append(a[-1])
         seen = {}
         validated = []
 
@@ -502,15 +497,11 @@ class DecodeMetadataTests(unittest.TestCase):
             return (self.hidden, self.residual, self.post, self.comb)
 
         session = NS(forward=forward, config=NS(control_device="cpu", control_group=None))
-        backend = module.MegaKernelModelBackend(session, {"static": 1}, {}, lambda *a: "identity")
+        backend = module.MegaKernelModelBackend(session, static_weights, {}, lambda *a: "identity")
         decode = self.prepare()
         fake_npu = NS(current_stream=lambda device: NS(synchronize=lambda: None))
-        modules = {
-            "vllm_ascend.models.glm5next.mega_kernel_abi": abi,
-            "vllm_ascend.models.glm5next.mega_kernel_collectives": collectives,
-        }
         with (
-            patch.dict(sys.modules, modules),
+            patch.object(module, "agree_or_abort", lambda error, *a: votes.append(a[-1])),
             patch.object(torch, "npu", fake_npu, create=True),
             patch.object(module, "_copy_live_kda_slots", side_effect=AssertionError("repeated prefix")),
         ):
@@ -544,6 +535,362 @@ class DecodeMetadataTests(unittest.TestCase):
         self.meta.non_spec_state_indices_tensor = torch.tensor([2, 2**32], dtype=torch.int64)
         with self.assertRaises(UnsupportedDecode):
             self.prepare()
+
+    def test_compact_strided_conv_skips_full_pool_copy_on_fast_path(self):
+        pool = torch.arange(8 * 384 * 3, dtype=torch.bfloat16).reshape(8, 384, 3)
+        strided = pool[::2]
+        self.layer.self_attn.kv_cache = (strided, torch.zeros(4, 1, 128, 128))
+        self.layer.self_attn._conv_state_dim_first = True
+
+        legacy = prepare_decode_inputs(
+            self.layer,
+            self.context,
+            self.hidden,
+            self.residual,
+            self.post,
+            self.comb,
+            execution_mode="eager",
+            scheduler_pure_decode=True,
+            compact_strided_conv=False,
+        )
+        self.assertIsNotNone(legacy.conv_writeback)
+
+        fast = prepare_decode_inputs(
+            self.layer,
+            self.context,
+            self.hidden,
+            self.residual,
+            self.post,
+            self.comb,
+            execution_mode="eager",
+            scheduler_pure_decode=True,
+            compact_strided_conv=True,
+        )
+        self.assertIsNone(fast.conv_writeback)
+        self.assertEqual(fast.conv_state.data_ptr(), strided.data_ptr())
+        self.assertIsNotNone(fast.conv_slots_i64)
+        self.assertIsNotNone(fast.recurrent_slots_i64)
+
+    def test_step_metadata_cache_collapses_34_layers_to_single_d2h_read(self):
+        step_cache = {}
+        transfers = []
+        orig_cpu = torch.Tensor.cpu
+
+        def track_cpu(tensor, *args, **kwargs):
+            transfers.append(tuple(tensor.shape))
+            return orig_cpu(tensor, *args, **kwargs)
+
+        layers = []
+        attn_map = {}
+        for idx in range(34):
+            prefix = f"layer.{idx}.kda"
+            attn_map[prefix] = NS(
+                num_prefills=0,
+                num_spec_decodes=0,
+                num_decodes=2,
+                num_actual_tokens=2,
+                num_decode_tokens=2,
+                non_spec_query_start_loc=self.meta.non_spec_query_start_loc,
+                non_spec_state_indices_tensor=self.recurrent_slots,
+                non_spec_decode_metadata=NS(causal_conv1d=NS(cache_indices=self.conv_slots)),
+                pcp_context=None,
+            )
+            layers.append(
+                NS(
+                    layer_kind="kda",
+                    _mlp_is_moe=True,
+                    mhc=True,
+                    is_mtp_layer=False,
+                    is_sequence_parallel=False,
+                    layer_idx=idx,
+                    num_hidden_layers=45,
+                    self_attn=NS(
+                        prefix=prefix,
+                        pcp_size=1,
+                        projection_tp=None,
+                        use_recoverssm=False,
+                        local_num_heads=1,
+                        kv_cache=(
+                            torch.zeros(4, 3, 384, dtype=torch.bfloat16),
+                            torch.zeros(4, 1, 128, 128),
+                        ),
+                        _conv_state_dim_first=False,
+                    ),
+                    mlp=NS(enable_eplb=False),
+                )
+            )
+        ctx = NS(attn_metadata=attn_map)
+        with patch.object(torch.Tensor, "cpu", track_cpu):
+            decoded = [
+                prepare_decode_inputs(
+                    layer,
+                    ctx,
+                    self.hidden,
+                    None if layer.layer_idx == 0 else self.residual,
+                    None if layer.layer_idx == 0 else self.post,
+                    None if layer.layer_idx == 0 else self.comb,
+                    execution_mode="eager",
+                    scheduler_pure_decode=True,
+                    step_cache=step_cache,
+                    compact_strided_conv=True,
+                )
+                for layer in layers
+            ]
+        self.assertEqual(len(transfers), 1)
+        for item in decoded[1:]:
+            self.assertIs(item.state_indices, decoded[0].state_indices)
+            self.assertIs(item.conv_slots_i64, decoded[0].conv_slots_i64)
+            self.assertIs(item.recurrent_slots_i64, decoded[0].recurrent_slots_i64)
+            self.assertIs(item.cu_seqlens, decoded[0].cu_seqlens)
+
+    def test_no_runtime_dependency_on_ops_test_directories(self):
+        glm5next_dir = Path(__file__).resolve().parents[3] / "vllm_ascend/models/glm5next"
+        for py_file in sorted(glm5next_dir.glob("mega_kernel_*.py")):
+            text = py_file.read_text(encoding="utf-8")
+            self.assertNotIn("mc2_integration", text, msg=py_file.name)
+            self.assertNotIn("cross_rank_prototype", text, msg=py_file.name)
+
+
+class StepDecodeCoordinatorTests(unittest.TestCase):
+    def _make_layers_and_ctx(self, count=3, *, corrupt_last_layer=False):
+        conv_slots = torch.tensor([1, 3], dtype=torch.int32)
+        rec_slots = torch.tensor([2, 0], dtype=torch.int32)
+        query = torch.tensor([0, 1, 2], dtype=torch.int32)
+        bias = torch.zeros(288)
+        router = type("AscendFusedTopKRouter", (), {})()
+        router.top_k = 8
+        router.scoring_func = "sigmoid"
+        router.renormalize = True
+        router.routed_scaling_factor = 2.5
+        router.num_expert_group = 1
+        router.topk_group = 1
+        router.e_score_correction_bias = bias
+        routed = NS(
+            router=router,
+            log2phy=None,
+            mix_placement=False,
+            _select_experts=lambda *a: None,
+            moe_config=NS(swiglu_limit=10.0),
+        )
+        attn_map = {}
+        layers = []
+        for idx in range(count):
+            prefix = f"layer.{idx}.kda"
+            attn_map[prefix] = NS(
+                num_prefills=0,
+                num_spec_decodes=0,
+                num_decodes=2,
+                num_actual_tokens=2,
+                num_decode_tokens=2,
+                non_spec_query_start_loc=query,
+                non_spec_state_indices_tensor=rec_slots,
+                non_spec_decode_metadata=NS(causal_conv1d=NS(cache_indices=conv_slots)),
+                pcp_context=None,
+            )
+            num_heads = 2 if (corrupt_last_layer and idx == count - 1) else 1
+            layer = NS(
+                layer_kind="kda",
+                _mlp_is_moe=True,
+                mhc=True,
+                is_mtp_layer=False,
+                is_sequence_parallel=False,
+                layer_idx=idx,
+                num_hidden_layers=45,
+                self_attn=NS(
+                    prefix=prefix,
+                    pcp_size=1,
+                    projection_tp=None,
+                    use_recoverssm=False,
+                    local_num_heads=num_heads,
+                    kv_cache=(torch.zeros(4, 3, 384, dtype=torch.bfloat16), torch.zeros(4, 1, 128, 128)),
+                    _conv_state_dim_first=False,
+                ),
+                mlp=NS(
+                    enable_eplb=False,
+                    routed_scaling_factor=2.5,
+                    experts=NS(routed_experts=routed, is_internal_router=True, _compute_router_logits=lambda *a: None),
+                    shared_experts=NS(swiglu_limit=10.0),
+                    gate=NS(e_score_correction_bias=bias),
+                ),
+            )
+            layers.append(layer)
+        return layers, NS(attn_metadata=attn_map)
+
+    def _external_stubs(self, ctx):
+        fwd = ModuleType("vllm.forward_context")
+        fwd.get_forward_context = lambda: ctx
+        kv = ModuleType("vllm.distributed.kv_transfer")
+        kv.has_kv_transfer_group = lambda: False
+        asc = ModuleType("vllm_ascend.ascend_config")
+        asc.get_ascend_config = lambda: NS(enable_force_eplb=False)
+        kda = ModuleType("vllm_ascend.models.glm5next.kda")
+        kda.maybe_save_kv_layer_to_connector = lambda *a: None
+        kda.record_attention_compute_start = lambda: None
+        kda.wait_for_kv_layer_from_connector = lambda *a: None
+        return {
+            "vllm": ModuleType("vllm"),
+            "vllm.forward_context": fwd,
+            "vllm.distributed": ModuleType("vllm.distributed"),
+            "vllm.distributed.kv_transfer": kv,
+            "vllm_ascend": ModuleType("vllm_ascend"),
+            "vllm_ascend.ascend_config": asc,
+            "vllm_ascend.models": ModuleType("vllm_ascend.models"),
+            "vllm_ascend.models.glm5next": ModuleType("vllm_ascend.models.glm5next"),
+            "vllm_ascend.models.glm5next.kda": kda,
+        }
+
+    def test_step_coordinator_single_preflight_fallback_and_midstep_abort(self):
+        layers, ctx = self._make_layers_and_ctx(count=3, corrupt_last_layer=False)
+        preflight_calls = []
+        finalize_calls = []
+        abort_calls = []
+        ensure_calls = []
+        forward_calls = []
+
+        class FakeGate:
+            def __init__(self):
+                self.cache = {}
+                self.verdict = None
+                self.cleanups = []
+
+            def current_step_cache(self):
+                return self.cache
+
+            def get_step_preflight(self):
+                return self.verdict
+
+            def set_step_preflight(self, v):
+                self.verdict = v
+
+            def register_step_cleanup(self, cb):
+                if cb not in self.cleanups:
+                    self.cleanups.append(cb)
+
+        class FakePool:
+            def __init__(self):
+                self._pending = []
+
+            def get_preflight_scratch(self):
+                return torch.zeros(1, dtype=torch.int32)
+
+            def has_pending(self):
+                return bool(self._pending)
+
+            def finalize_step(self, dev, grp):
+                finalize_calls.append(len(self._pending))
+                self._pending.clear()
+
+            def abort_step(self, mark_failed=True):
+                abort_calls.append((mark_failed, len(self._pending)))
+                self._pending.clear()
+
+        gate = FakeGate()
+        pool = FakePool()
+        hidden = torch.ones(2, 4096, dtype=torch.bfloat16)
+        res = torch.ones(2, 4, 4096, dtype=torch.bfloat16)
+        post = torch.ones(2, 4, 1)
+        comb = torch.ones(2, 4, 4)
+
+        entries = []
+        for layer in layers:
+            session = NS(
+                forward=lambda *a, **k: None,
+                ensure_geometry=lambda rows, stream, idx=layer.layer_idx: ensure_calls.append((idx, rows)),
+                forward_layer=lambda **kw: (pool._pending.append(1) or forward_calls.append(kw["is_first_layer"]) or (hidden, res, post, comb)),
+            )
+            backend = module.MegaKernelModelBackend(session, {"static": 1}, {"stage_limit": 28}, lambda *a: "id")
+            backend.session.bridge = NS(stage_limit=28)
+            entries.append((layer, backend))
+
+        coord = module.StepDecodeCoordinator(
+            gate=gate,
+            pool=pool,
+            control_device="cpu",
+            control_group=None,
+            layer_entries=entries,
+            defer_state_commit=True,
+        )
+
+        def fake_preflight(err, pure, dev, grp, *, scratch=None):
+            preflight_calls.append(err)
+            if err is not None and not isinstance(err, UnsupportedDecode):
+                raise module.MegaKernelCollectiveError("abort") from err
+            return err is None and pure
+
+        orig_calls = []
+        for layer, backend in entries:
+            layer.forward = lambda p, h, r=None, po=None, c=None, idx=layer.layer_idx: orig_calls.append(idx) or (h, r, po, c)
+            module.DecodeLayerAdapter(
+                backend,
+                lambda l, e: True,
+                lambda: "eager",
+                lambda l: True,
+                coordinator=coord,
+            ).install(layer)
+
+        stubs = self._external_stubs(ctx)
+        fake_npu = NS(current_stream=lambda d: NS(npu_stream=1))
+        with (
+            patch.dict(sys.modules, stubs),
+            patch.object(module, "coordinate_layer_preflight", fake_preflight),
+            patch.object(torch, "npu", fake_npu, create=True),
+        ):
+            h, r, p, c = hidden, None, None, None
+            for layer in layers:
+                h, r, p, c = layer.forward(None, h, r, p, c)
+            self.assertEqual(len(preflight_calls), 1)
+            self.assertEqual(len(ensure_calls), 3)
+            self.assertEqual(forward_calls, [True, False, False])
+            self.assertEqual(finalize_calls, [3])
+
+            # Early exit while TX pending triggers abort + MegaKernelCollectiveError.
+            pool._pending.append(1)
+            with self.assertRaises(module.MegaKernelCollectiveError):
+                coord.on_step_exit(failed=False)
+            self.assertEqual(abort_calls, [(True, 1)])
+
+            # Mid-step failure after group accept raises MegaKernelCollectiveError.
+            gate.verdict = None
+            gate.cache.clear()
+            layers[0].forward(None, hidden, None, None, None)
+            layers[1].self_attn.use_recoverssm = True
+            with self.assertRaises(module.MegaKernelCollectiveError):
+                layers[1].forward(None, hidden, res, post, comb)
+            pool._pending.clear()
+
+        # Unsupported last layer detected during Layer-0 preflight routes ALL 3 layers to original path.
+        layers2, ctx2 = self._make_layers_and_ctx(count=3, corrupt_last_layer=True)
+        preflight_calls.clear()
+        orig_calls.clear()
+        entries2 = []
+        for layer in layers2:
+            session = NS(forward=lambda *a, **k: None, ensure_geometry=lambda *a: None, forward_layer=lambda **k: None)
+            backend = module.MegaKernelModelBackend(session, {"static": 1}, {"stage_limit": 28}, lambda *a: "id")
+            backend.session.bridge = NS(stage_limit=28)
+            entries2.append((layer, backend))
+        coord2 = module.StepDecodeCoordinator(
+            gate=FakeGate(),
+            pool=FakePool(),
+            control_device="cpu",
+            control_group=None,
+            layer_entries=entries2,
+            defer_state_commit=True,
+        )
+        for layer, backend in entries2:
+            layer.forward = lambda p, h, r=None, po=None, c=None, idx=layer.layer_idx: orig_calls.append(idx) or (h, r, po, c)
+            module.DecodeLayerAdapter(
+                backend, lambda l, e: False, lambda: "eager", lambda l: True, coordinator=coord2
+            ).install(layer)
+        with (
+            patch.dict(sys.modules, self._external_stubs(ctx2)),
+            patch.object(module, "coordinate_layer_preflight", fake_preflight),
+            patch.object(torch, "npu", fake_npu, create=True),
+        ):
+            for layer in layers2:
+                layer.forward(None, hidden, res, post, comb)
+        self.assertEqual(len(preflight_calls), 1)
+        self.assertIsInstance(preflight_calls[0], UnsupportedDecode)
+        self.assertEqual(orig_calls, [0, 1, 2])
 
 
 if __name__ == "__main__":

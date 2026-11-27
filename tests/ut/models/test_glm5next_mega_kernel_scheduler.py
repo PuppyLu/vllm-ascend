@@ -121,6 +121,55 @@ class SchedulerTests(unittest.TestCase):
         finally:
             gate.uninstall()
 
+    def test_three_arg_agreement_and_step_scoped_cache_preflight_cleanup(self):
+        case = self
+        events = []
+
+        class Runner:
+            pcp_manager = None
+            vllm_config = case.runner.vllm_config
+
+            def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc, num_active_loras):
+                return case.batch
+
+            def execute_model(self, scheduler_output, dummy_run=False, is_profile=False):
+                self.prepare_inputs(scheduler_output, case.req, case.desc, 0)
+                cache = gate.current_step_cache()
+                cache["k"] = "v"
+                gate.set_step_preflight("accepted")
+                gate.register_step_cleanup(lambda failed: events.append(("cleanup", failed)))
+                if getattr(scheduler_output, "fail", False):
+                    raise RuntimeError("boom")
+                return (
+                    gate.current_step_rows(),
+                    gate.get_step_preflight(),
+                    dict(gate.current_step_cache()),
+                )
+
+        gate = module.V2SchedulerEvidence(Runner, capture_guard=lambda: True)
+        seen = []
+        gate.set_step_agreement(lambda accepted, digest, rows: seen.append((accepted, rows)) or accepted)
+        gate.install()
+        try:
+            runner = Runner()
+            rows, verdict, snapshot = runner.execute_model(self.sched)
+            self.assertEqual((rows, verdict, snapshot), (2, "accepted", {"k": "v"}))
+            self.assertIsNone(gate.current_step_cache())
+            self.assertIsNone(gate.get_step_preflight())
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                runner.execute_model(
+                    NS(
+                        num_scheduled_tokens=self.sched.num_scheduled_tokens,
+                        scheduled_spec_decode_tokens=self.sched.scheduled_spec_decode_tokens,
+                        fail=True,
+                    )
+                )
+            self.assertEqual(seen, [(True, 2), (True, 2)])
+            self.assertEqual(events, [("cleanup", False), ("cleanup", True)])
+            self.assertIsNone(gate.current_step_cache())
+        finally:
+            gate.uninstall()
+
 
 if __name__ == "__main__":
     unittest.main()

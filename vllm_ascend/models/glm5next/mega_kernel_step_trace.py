@@ -36,9 +36,11 @@ def install_decode_step_trace(runner, gate, config, *, group_agreed):
     ):
         raise ValueError("Decode step matching currently requires PP1 and same ordered TP/EP world")
     if not group_agreed:
+        control = dist.new_group(ranks=members, backend="gloo")
+        control_device = torch.device("cpu")
 
-        def agree_step(eligible, digest, local_error):
-            return agree_decode_step(eligible, digest, runner.device, dist.group.WORLD, local_error=local_error)
+        def agree_step(eligible, digest, local_error=None):
+            return agree_decode_step(eligible, digest, control_device, control, local_error=local_error)
 
         gate.set_step_agreement(agree_step)
     hook = V2DecodeStepHook(

@@ -1,18 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Experimental GLM5Next MegaKernel bootstrap for vLLM-Ascend ebaaeeec5.
-
-The V2 runner installs this opt-in after weights load on every rank. A supplied
-independent manifest or an explicitly accepted loaded-weight observation is
-required. The latter checks self-consistency, not checkpoint provenance. The
-mapper and bridge are correctness-first prototypes, not an A3 validation.
-
-Only eager, PP=1, TP and EP equal the entire world in identical rank order are
-accepted here. Those restrictions are for this bootstrap, not the operator.
-Do not infer support of graph replay, separate topology or end-to-end speedup.
-A per-process teardown or rank failure after submission requires job abort.
-"""
+"""Experimental GLM5Next MegaKernel startup bootstrap and cold admission."""
 
 from __future__ import annotations
 
@@ -23,22 +12,44 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from mc2_integration.stage24_admission import NATIVE_SHARED_PROTOCOL, IndependentIdentity, ReviewedIndependentAbi
-from mc2_integration.torch_acl_bridge import _check_tensor
-from mc2_integration.vllm_mc2_bridge import Mc2SessionConfig
 
-from vllm_ascend.models.glm5next.mega_kernel_abi import ATTR_NAMES, aligned_copy
+from vllm_ascend.models.glm5next.mega_kernel_abi import (
+    ATTR_NAMES,
+    HEAD_FIELDS,
+    MODEL_FIELDS,
+    NATIVE_SHARED_PROTOCOL,
+    SHARED_FIELDS,
+    ReviewedAbi,
+    StepIdentity,
+    aligned_copy,
+    check_abi_tensor,
+    expert_bank_digest,
+    tensor_sha256,
+    validate_expert_bank,
+    validate_projection_shapes,
+)
 from vllm_ascend.models.glm5next.mega_kernel_adapter import (
     DecodeLayerAdapter,
     MegaKernelModelBackend,
+    StepDecodeCoordinator,
     benchmark_consumer_ready,
     coordinate_layer_preflight,
     validate_model_path_config,
 )
-from vllm_ascend.models.glm5next.mega_kernel_collectives import agree_decode_step
-from vllm_ascend.models.glm5next.mega_kernel_collectives import agree_or_abort as _agree
+from vllm_ascend.models.glm5next.mega_kernel_collectives import (
+    HcclDomainInspector,
+    admission_control,
+    agree_decode_step_contract,
+    agree_or_abort,
+    digest_agreement,
+)
 from vllm_ascend.models.glm5next.mega_kernel_scheduler import V2SchedulerEvidence
-from vllm_ascend.models.glm5next.mega_kernel_torch_session import create_torch_session
+from vllm_ascend.models.glm5next.mega_kernel_torch_session import (
+    Mc2SessionConfig,
+    SharedStepBufferPool,
+    create_torch_session,
+    load_torch_mc2_extension,
+)
 from vllm_ascend.models.glm5next.mega_kernel_weights import _reuse_or_align_weights, map_static_weights
 
 _gate = None
@@ -113,30 +124,69 @@ def _check_attrs(layer, attrs, stage, world):
     for key, value in expected.items():
         if attrs[key] != value:
             raise ValueError(f"model and reviewed manifest disagree on {key}")
-    # output_norm_eps must independently match the actual FLA layer; accepted
-    # property names depend on deployed vLLM version, so reject absent values.
     eps = getattr(layer.self_attn.o_norm, "eps", None)
     if eps is None or attrs["output_norm_eps"] != eps:
         raise ValueError("output norm epsilon missing or disagrees with model")
 
 
-def bootstrap(runner: Any, config_path: str):
-    """Install all supported target layers; no hidden per-layer factory needed.
+def _opt_bool(cfg: dict[str, Any], key: str, default: bool) -> bool:
+    val = cfg.get(key, default)
+    if type(val) is not bool:
+        raise ValueError(f"{key} must be a boolean")
+    return val
 
-    JSON config: `manifest_path`, `opapi_path`, `generated_header_path`,
-    `reviewed_generated_header: true`, `expert_postprocessed: true`,
-    `tp_algorithm`, `ep_algorithm`, and optional `allow_nz: false`. The model
-    uses the internal router and a single SPMD-trusted execution path without
-    the output D2H workaround; actual model accuracy requires A3 validation.
-    Manifest schema `megakernel.model_manifest.v1`: `model_digest`,
-    `generated_header_sha256`, `max_rows_per_source`, `max_total_rows`,
-    `layers` keyed by layer_idx. Every layer contains `attrs`, ordered
-    `expert_shard_digests`, `head_shard_digests`, `shared_shard_digests`, and
-    `model_shared_intermediate`. A manifest may be independently supplied, or
-    generated from loaded tensors with an explicit self-consistency opt-in.
-    The latter is not independent checkpoint evidence. Config and any supplied
-    manifest must be identical across ranks. No weight refit is allowed.
-    """
+
+def _opt_optional_bool(cfg: dict[str, Any], key: str) -> bool | None:
+    val = cfg.get(key)
+    if val is not None and type(val) is not bool:
+        raise ValueError(f"{key} must be a boolean")
+    return val
+
+
+def _opt_pos_int(cfg: dict[str, Any], key: str, default: int) -> int:
+    val = cfg.get(key, default)
+    if type(val) is not int or val < 1:
+        raise ValueError(f"{key} must be a positive integer")
+    return val
+
+
+def _verify_layer_weights_startup(
+    weights: dict[str, Any],
+    manifest_item: dict[str, Any],
+    *,
+    heads: int,
+    tp_rank: int,
+    ep_rank: int,
+    world: int,
+) -> tuple[str, bytes]:
+    validate_projection_shapes(weights, heads)
+    shared_width = int(manifest_item["model_shared_intermediate"])
+    local_shared_width = int(weights["expert_down_weight"].shape[1])
+    if shared_width <= 0 or shared_width > 2048 * world:
+        raise ValueError("unsupported model_shared_intermediate in manifest")
+    validate_expert_bank(weights, ep_rank, world, "sharded", shared_width=local_shared_width)
+    if expert_bank_digest(weights) != manifest_item["expert_shard_digests"][ep_rank]:
+        raise ValueError("local expert shard disagrees with reviewed manifest")
+    head_fields = [(name, weights[name]) for name in MODEL_FIELDS if name in HEAD_FIELDS and weights.get(name) is not None]
+    if tensor_sha256(head_fields).hex() != manifest_item["head_shard_digests"][tp_rank]:
+        raise ValueError("local head weights differ from reviewed shard manifest")
+    shared_fields = [(name, weights[name]) for name in MODEL_FIELDS if name in SHARED_FIELDS and weights.get(name) is not None]
+    if tensor_sha256(shared_fields).hex() != manifest_item["shared_shard_digests"][tp_rank]:
+        raise ValueError("local shared-expert weights differ from reviewed shard manifest")
+    rep_fields = [
+        (name, weights[name])
+        for name in MODEL_FIELDS
+        if name not in HEAD_FIELDS and name not in SHARED_FIELDS and weights.get(name) is not None
+    ]
+    rep_hash = tensor_sha256(rep_fields).hex()
+    fa_ga_fields = [("f_g_a", weights["projection_weight"][-256:])]
+    if weights.get("in_projection_scale") is not None:
+        fa_ga_fields.append(("f_g_a_scale", weights["in_projection_scale"][-256:]))
+    return rep_hash, tensor_sha256(fa_ga_fields)
+
+
+def bootstrap(runner: Any, config_path: str):
+    """Install all supported target layers with startup-only cold admission and shared pools."""
     from vllm.distributed.parallel_state import get_ep_group, get_pp_group, get_tp_group
 
     if _gate is None or not dist.is_initialized():
@@ -161,7 +211,15 @@ def bootstrap(runner: Any, config_path: str):
             or dist.get_process_group_ranks(get_ep_group().device_group) != members
         ):
             raise ValueError("requires PP1 and full-world ordered TP=EP in this bootstrap")
-        header_hash = hashlib.sha256(Path(cfg["generated_header_path"]).read_bytes()).hexdigest()
+        repeatable_executor = _opt_bool(cfg, "repeatable_executor", True)
+        sync_per_layer_cfg = _opt_optional_bool(cfg, "sync_per_layer")
+        consumer_readback = _opt_bool(cfg, "consumer_readback", False)
+        defer_state_commit = _opt_bool(cfg, "defer_state_commit", True)
+        max_cached_geometries = _opt_pos_int(cfg, "max_cached_geometries", 8)
+        header_path = Path(cfg["generated_header_path"])
+        if not header_path.is_absolute() or not header_path.is_file():
+            raise ValueError("generated_header_path must be an existing absolute file")
+        header_hash = hashlib.sha256(header_path.read_bytes()).hexdigest()
         manifest_path = cfg.get("manifest_path")
         if manifest_path is not None:
             manifest_raw = Path(manifest_path).read_bytes()
@@ -193,18 +251,17 @@ def bootstrap(runner: Any, config_path: str):
                 raise ValueError("invalid single-layer benchmark config or missing event-stream attestation")
     except Exception as exc:
         local_error = exc
-    # This is the existing world group, before any new HCCL group is created.
-    _agree(local_error, device, dist.group.WORLD, "MC2 bootstrap local setup")
+    agree_or_abort(local_error, device, dist.group.WORLD, "MC2 bootstrap local setup")
     if local_error is not None:
         raise local_error
-    control = dist.new_group(ranks=members, backend="hccl")
+
+    # Isolate MC2 control-plane consensus onto CPU Gloo so host coordination
+    # never interleaves with device HCCL / AICPU streams during Decode steps.
+    control = dist.new_group(ranks=members, backend="gloo")
+    control_device = torch.device("cpu")
     tp = dist.new_group(ranks=members, backend="hccl")
     ep = dist.new_group(ranks=members, backend="hccl")
-    hashes = [None] * world
-    digest = hashlib.sha256(cfg_raw + b"\0" + manifest_raw).hexdigest()
-    dist.all_gather_object(hashes, digest, group=control)
-    if len(set(hashes)) != 1:
-        raise RuntimeError("bootstrap config/manifest differs across ranks")
+    digest_agreement(cfg_raw + b"\0" + manifest_raw, control_device, control, "MC2 bootstrap config and manifest")
     all_ids = [None] * world
     dist.all_gather_object(all_ids, ids, group=control)
     if any(x != ids for x in all_ids):
@@ -234,7 +291,7 @@ def bootstrap(runner: Any, config_path: str):
             raise ValueError("generated header differs from reviewed manifest")
         if set(map(str, ids)) != set(manifest["layers"]):
             raise ValueError("manifest must cover exactly every target layer")
-        abi = ReviewedIndependentAbi(
+        abi = ReviewedAbi(
             manifest["generated_header_sha256"],
             NATIVE_SHARED_PROTOCOL,
             manifest["max_rows_per_source"],
@@ -244,18 +301,42 @@ def bootstrap(runner: Any, config_path: str):
             50,
         )
         abi.validate()
+        tp_name, ep_name = HcclDomainInspector().inspect((tp, ep), device, rank, world)
+        op, prepare_fn = load_torch_mc2_extension()
     except Exception as exc:
         local_error = exc
-    _agree(local_error, device, control, "MC2 manifest validation")
+    agree_or_abort(local_error, control_device, control, "MC2 manifest and HCCL domain admission")
     if local_error is not None:
         raise local_error
-    # The group agrees both phase and the exact ordered request/position digest
-    # before the reference prefix can enter its TP collective. The sequence
-    # advances only after this all-rank agreement, so it is not a local guess.
+    for group, count in ((tp, world), (ep, world)):
+        ping = torch.ones(16, dtype=torch.float32, device=device)
+        dist.all_reduce(ping, group=group)
+        if not bool(torch.all(ping == count).item()):
+            raise ValueError("HCCL domain warmup mismatch")
+    digest_agreement(json.dumps(tp_name).encode("utf-8"), device, tp, "MC2 TP domain name")
+    digest_agreement(json.dumps(ep_name).encode("utf-8"), device, ep, "MC2 EP domain name")
+    torch.npu.synchronize(device)
+
+    use_repeatable = repeatable_executor and prepare_fn is not None
+    sync_per_layer = (not use_repeatable) if sync_per_layer_cfg is None else sync_per_layer_cfg
+
+    pool = SharedStepBufferPool(device, max_cached_geometries=max_cached_geometries, control_device=control_device)
+    step_contract_scratch = pool.get_step_contract_scratch()
     sequence = [0]
 
-    def agree_step(accepted, step_digest, local_error):
-        same = agree_decode_step(accepted, step_digest, device, control, local_error=local_error)
+    def agree_step(accepted, step_digest, rows, local_error=None):
+        same, _ = agree_decode_step_contract(
+            accepted,
+            rows,
+            step_digest,
+            abi.max_rows_per_source,
+            abi.max_total_rows,
+            world,
+            control_device,
+            control,
+            scratch=step_contract_scratch,
+            local_error=local_error,
+        )
         if same:
             if sequence[0] >= 2**31 - 1:
                 raise RuntimeError("MC2 session step counter exhausted; restart the job")
@@ -263,8 +344,10 @@ def bootstrap(runner: Any, config_path: str):
         return same
 
     _gate.set_step_agreement(agree_step)
-    sessions, adapters = [], []
-    for layer in layers:
+
+    sessions, layer_backends = [], []
+    prop_rounds = admission_control(1, world, True)
+    for ordinal, layer in enumerate(layers):
         item = manifest["layers"][str(layer.layer_idx)]
         local_error = None
         try:
@@ -275,8 +358,16 @@ def bootstrap(runner: Any, config_path: str):
             weights = map_static_weights(
                 layer, ep_rank=rank, ep_world=world, allow_nz=cfg.get("allow_nz") is True, expert_postprocessed=True
             )
-            weights = _reuse_or_align_weights(weights, device, _check_tensor, aligned_copy)
+            weights = _reuse_or_align_weights(weights, device, check_abi_tensor, aligned_copy)
             _check_attrs(layer, item["attrs"], 28, world)
+            rep_hash, fa_ga_digest = _verify_layer_weights_startup(
+                weights,
+                item,
+                heads=heads,
+                tp_rank=head_rank,
+                ep_rank=rank,
+                world=world,
+            )
             sc = Mc2SessionConfig(
                 cfg["opapi_path"],
                 cfg["generated_header_path"],
@@ -287,7 +378,7 @@ def bootstrap(runner: Any, config_path: str):
                 control,
                 tp,
                 ep,
-                device,
+                control_device,
                 cfg["tp_algorithm"],
                 cfg["ep_algorithm"],
                 tuple(item["expert_shard_digests"]),
@@ -297,38 +388,75 @@ def bootstrap(runner: Any, config_path: str):
                 padding_supported=True,
                 shared_tp_sharded=True,
                 native_shared=True,
-                consumer_readback=False,
+                consumer_readback=consumer_readback,
+                repeatable_executor=repeatable_executor,
+                sync_per_layer=sync_per_layer,
+                defer_state_commit=defer_state_commit,
+                max_cached_geometries=max_cached_geometries,
+                tp_group_name=tp_name,
+                ep_group_name=ep_name,
+                ep_rank=rank,
+                propagation_rounds=prop_rounds,
+                generated_header_sha256=header_hash,
+                compute_device=device,
             )
-            # A process-lifetime epoch is valid only under the explicit no-refit
-            # and no-group-replacement contract checked during startup.
             epoch = manifest["model_digest"] + ":" + str(layer.layer_idx)
-            session = create_torch_session(sc, lambda epoch=epoch: epoch)
+            session = create_torch_session(
+                sc,
+                lambda epoch=epoch: epoch,
+                layer_idx=layer.layer_idx,
+                layer_ordinal=ordinal,
+                static_weights=weights,
+                attrs=item["attrs"],
+                buffer_pool=pool,
+                op=op,
+                prepare_fn=prepare_fn,
+            )
+
+            def identity_factory(actual_layer, decode, *, model_digest=manifest["model_digest"]):
+                del decode
+                digest = _gate.current_step_digest()
+                if sequence[0] < 1:
+                    raise RuntimeError("MC2 logical step has not been agreed across ranks")
+                return StepIdentity(actual_layer.layer_idx, sequence[0], model_digest, digest)
+
+            backend = MegaKernelModelBackend(session, weights, item["attrs"], identity_factory)
+            backend.validate_static_once(layer)
         except Exception as exc:
             local_error = exc
-        if not _all_true(local_error is None, device, control):
+        if not _all_true(local_error is None, control_device, control):
             raise RuntimeError(f"group-wide MC2 model bootstrap failed; local error: {local_error}")
+        digest_agreement(rep_hash.encode("ascii"), control_device, control, "startup replicated weight contract")
+        expected_rep = item.get("observed_replicated_digest")
+        if isinstance(expected_rep, str) and rep_hash != expected_rep:
+            raise ValueError("replicated weights differ from manifest digest")
+        digest_agreement(fa_ga_digest, control_device, control, "startup replicated f_a/g_a projection")
+        sessions.append(session)
+        layer_backends.append((layer, backend))
 
-        def identity_factory(actual_layer, decode, *, model_digest=manifest["model_digest"]):
-            digest = _gate.current_step_digest()
-            if sequence[0] < 1:
-                raise RuntimeError("MC2 logical step has not been agreed across ranks")
-            return IndependentIdentity(actual_layer.layer_idx, sequence[0], model_digest, digest)
+    coordinator = StepDecodeCoordinator(
+        gate=_gate,
+        pool=pool,
+        control_device=control_device,
+        control_group=control,
+        layer_entries=layer_backends,
+        defer_state_commit=defer_state_commit,
+    )
+    preflight_scratch = pool.get_preflight_scratch()
 
-        backend = MegaKernelModelBackend(session, weights, item["attrs"], identity_factory)
+    def coordinate(actual_layer, error):
+        del actual_layer
+        return coordinate_layer_preflight(error, _gate.is_pure_decode(), control_device, control, scratch=preflight_scratch)
 
-        def coordinate(actual_layer, error):
-            del actual_layer
-            # Unexpected exceptions abort every rank; known unsupported input
-            # permits a group-wide fallback before any MC2 collective.
-            return coordinate_layer_preflight(error, _gate.is_pure_decode(), device, control)
+    def execution_mode():
+        return _gate.execution_mode()
 
-        def execution_mode():
-            return _gate.execution_mode()
+    def decode_evidence(actual_layer):
+        del actual_layer
+        return _gate.is_pure_decode()
 
-        def decode_evidence(actual_layer):
-            del actual_layer
-            return _gate.is_pure_decode()
-
+    adapters = []
+    for layer, backend in layer_backends:
         benchmark = None
         if bench_cfg is not None and layer.layer_idx == bench_cfg["layer"]:
 
@@ -349,7 +477,7 @@ def bootstrap(runner: Any, config_path: str):
                     post,
                     comb,
                     control_group=control,
-                    control_device=device,
+                    control_device=control_device,
                     consumer_ready=consumer_ready,
                     events_join_required_work=True,
                     logical_step_agreed=True,
@@ -366,16 +494,33 @@ def bootstrap(runner: Any, config_path: str):
                             f.write("\n")
                     except Exception as exc:
                         write_error = exc
-                _agree(write_error, device, control, "single-layer benchmark report")
+                agree_or_abort(
+                    write_error,
+                    control_device,
+                    control,
+                    "single-layer benchmark report",
+                    scratch=pool.get_agree_scratch(),
+                )
                 if write_error is not None:
                     raise write_error
                 return True
 
-        sessions.append(session)
-        adapters.append((layer, DecodeLayerAdapter(backend, coordinate, execution_mode, decode_evidence, benchmark)))
-    # All local preparation and group-level agreement succeeded. Do not leave
-    # partially installed layers if validation fails before this point.
+        adapters.append(
+            (
+                layer,
+                DecodeLayerAdapter(
+                    backend,
+                    coordinate,
+                    execution_mode,
+                    decode_evidence,
+                    benchmark,
+                    coordinator=coordinator,
+                ),
+            )
+        )
+
     for layer, adapter in adapters:
         adapter.install(layer)
     runner._megakernel_sessions = sessions
+    torch.npu.synchronize(device)
     return ids

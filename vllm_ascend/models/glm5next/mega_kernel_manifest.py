@@ -26,10 +26,16 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from mc2_integration.distributed_mc2 import _tensor_hash, expert_bank_digest
-from mc2_integration.stage24_admission import HEAD_FIELDS, MODEL_FIELDS, NATIVE_SHARED_PROTOCOL, SHARED_FIELDS
 
-from vllm_ascend.models.glm5next.mega_kernel_abi import ATTR_NAMES
+from vllm_ascend.models.glm5next.mega_kernel_abi import (
+    ATTR_NAMES,
+    HEAD_FIELDS,
+    MODEL_FIELDS,
+    NATIVE_SHARED_PROTOCOL,
+    SHARED_FIELDS,
+    expert_bank_digest,
+    tensor_sha256 as _tensor_hash,
+)
 from vllm_ascend.models.glm5next.mega_kernel_weights import map_static_weights
 
 

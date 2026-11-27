@@ -27,7 +27,7 @@ import inspect
 import json
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -48,6 +48,10 @@ class _Frame:
     pure: bool = False
     reason: str = "unprepared"
     logical_step_id: str | None = None
+    rows: int = 0
+    step_metadata_cache: dict[Any, Any] = field(default_factory=dict)
+    step_preflight_verdict: str | None = None
+    step_abort_hooks: list[Callable[[bool], None]] = field(default_factory=list)
 
 
 _frame = contextvars.ContextVar("megakernel_v2_decode_evidence", default=None)
@@ -160,12 +164,21 @@ class V2SchedulerEvidence:
         self._wrappers: dict[str, Any] = {}
         self._installed = False
         self._step_agreement = None
+        self._step_agreement_arity = 0
+        self._step_agreement_third_is_error = False
         self._execute_lock = threading.Lock()
 
-    def set_step_agreement(self, agreement: Callable[[bool, str | None, Exception | None], bool]) -> None:
+    def set_step_agreement(self, agreement: Callable[..., bool]) -> None:
         if self._step_agreement is not None or not callable(agreement):
             raise RuntimeError("a single group-wide step agreement is required")
+        params = [
+            p
+            for p in inspect.signature(agreement).parameters.values()
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ]
         self._step_agreement = agreement
+        self._step_agreement_arity = len(params)
+        self._step_agreement_third_is_error = len(params) == 3 and "error" in params[2].name.lower()
 
     def _current(self) -> _Frame | None:
         frame = _frame.get()
@@ -192,6 +205,33 @@ class V2SchedulerEvidence:
         if frame is None or frame.logical_step_id is None:
             raise EvidenceUnavailable("step digest requested outside a verified Decode execution")
         return frame.logical_step_id
+
+    def current_step_rows(self) -> int:
+        frame = self._current()
+        if frame is None or frame.rows <= 0:
+            raise EvidenceUnavailable("step rows requested outside a verified Decode execution")
+        return frame.rows
+
+    def current_step_cache(self) -> dict[Any, Any] | None:
+        frame = self._current()
+        return None if frame is None else frame.step_metadata_cache
+
+    def get_step_preflight(self) -> str | None:
+        frame = self._current()
+        return None if frame is None else frame.step_preflight_verdict
+
+    def set_step_preflight(self, verdict: str) -> None:
+        frame = self._current()
+        if frame is None:
+            raise EvidenceUnavailable("cannot record preflight verdict outside an active Decode step")
+        frame.step_preflight_verdict = verdict
+
+    def register_step_cleanup(self, hook: Callable[[bool], None]) -> None:
+        frame = _frame.get()
+        if not isinstance(frame, _Frame) or frame.owner is not self or frame.thread_id != threading.get_ident():
+            raise EvidenceUnavailable("cannot register step cleanup outside execute_model")
+        if hook not in frame.step_abort_hooks:
+            frame.step_abort_hooks.append(hook)
 
     def step_id(self, runner: Any, scheduler_output: Any, batch: Any) -> str:
         del batch
@@ -231,11 +271,26 @@ class V2SchedulerEvidence:
                 bound.arguments["dummy_run"] is False and bound.arguments["is_profile"] is False,
             )
             token = _frame.set(frame)
+            failed = True
             try:
-                return execute(runner, *args, **kwargs)
+                result = execute(runner, *args, **kwargs)
+                failed = False
+                return result
             finally:
+                cleanup_error = None
+                for hook in reversed(frame.step_abort_hooks):
+                    try:
+                        hook(failed)
+                    except Exception as exc:
+                        if cleanup_error is None:
+                            cleanup_error = exc
+                frame.step_abort_hooks.clear()
+                frame.step_preflight_verdict = None
+                frame.step_metadata_cache.clear()
                 _frame.reset(token)
                 gate._execute_lock.release()
+                if cleanup_error is not None and not failed:
+                    raise cleanup_error
 
         @functools.wraps(prepare)
         def prepare_inputs(runner: Any, *args: Any, **kwargs: Any):
@@ -249,11 +304,13 @@ class V2SchedulerEvidence:
                 return prepare(runner, *args, **kwargs)
             frame.prepare_calls += 1
             frame.pure = False
+            frame.rows = 0
             if not frame.permitted_execute:
                 frame.reason = "dummy or profile"
                 return prepare(runner, *args, **kwargs)
-            local_error = None
+            local_error: Exception | None = None
             batch = None
+            bound = None
             try:
                 bound = prepare_sig.bind(runner, *args, **kwargs)
                 bound.apply_defaults()
@@ -265,16 +322,19 @@ class V2SchedulerEvidence:
                 frame.reason = "step_preparation_failed"
             if local_error is None:
                 try:
+                    assert bound is not None
                     if bound.arguments["scheduler_output"] is not frame.scheduler_output:
                         frame.reason = "scheduler object changed"
                     else:
+                        req_state = bound.arguments["batch_req_state"]
                         frame.logical_step_id = _classify(
                             runner,
                             frame.scheduler_output,
-                            bound.arguments["batch_req_state"],
+                            req_state,
                             bound.arguments["batch_desc"],
                             batch,
                         )
+                        frame.rows = len(req_state.req_ids)
                         frame.pure = gate.capture_guard() is True
                         frame.reason = "pure_decode" if frame.pure else "capture_guard_failed"
                 except EvidenceUnavailable as exc:
@@ -286,12 +346,19 @@ class V2SchedulerEvidence:
                 # All ranks must execute the same ordinary model step here.
                 # Dummy/profile runs never enter this collective. A transport
                 # failure must be handled by the distributed job watchdog.
-                accepted = gate._step_agreement(frame.pure, frame.logical_step_id, local_error)
+                if gate._step_agreement_arity >= 4:
+                    accepted = gate._step_agreement(frame.pure, frame.logical_step_id, frame.rows, local_error)
+                elif gate._step_agreement_arity == 3:
+                    third = local_error if gate._step_agreement_third_is_error else frame.rows
+                    accepted = gate._step_agreement(frame.pure, frame.logical_step_id, third)
+                else:
+                    accepted = gate._step_agreement(frame.pure, frame.logical_step_id)
                 if type(accepted) is not bool:
                     raise RuntimeError("step agreement did not return a boolean")
                 frame.pure = frame.pure and accepted
                 if not accepted:
                     frame.reason = "group_decode_contract_not_met"
+                    frame.rows = 0
             if local_error is not None:
                 raise local_error
             return batch

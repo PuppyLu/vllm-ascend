@@ -125,6 +125,17 @@ class DecodeMetadataTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_ordered_rpc_simulation_for_successive_requests(self):
+        worker = Path(__file__).with_name("mega_kernel_rpc_gloo_worker.py")
+        result = subprocess.run(
+            [sys.executable, str(worker)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_real_slot_columns_and_single_token_template(self):
         result = self.prepare()
         torch.testing.assert_close(result.state_indices, torch.tensor([[1, 2], [3, 0]], dtype=torch.int32))
@@ -891,6 +902,141 @@ class StepDecodeCoordinatorTests(unittest.TestCase):
         self.assertEqual(len(preflight_calls), 1)
         self.assertIsInstance(preflight_calls[0], UnsupportedDecode)
         self.assertEqual(orig_calls, [0, 1, 2])
+
+    def test_final_layer_deferred_contract_coordinates_errors_even_without_commit_pool(self):
+        layers, ctx = self._make_layers_and_ctx(count=1, corrupt_last_layer=False)
+        layer = layers[0]
+        layer.layer_idx = 0
+        layer.num_hidden_layers = 1
+        layer.n = 4
+        layer.forward = lambda *a, **k: (hidden, None, None, None)
+        layer.hc_post = lambda *a: (_ for _ in ()).throw(RuntimeError("hc_post boom"))
+        hidden = torch.ones(2, 4096, dtype=torch.bfloat16)
+        res = torch.ones(2, 4, 4096, dtype=torch.bfloat16)
+        post = torch.ones(2, 4, 1)
+        comb = torch.ones(2, 4, 4)
+        session = NS(
+            config=NS(control_device="cpu", control_group="ctrl"),
+            forward=lambda *a, **k: None,
+            ensure_geometry=lambda rows, stream: None,
+            forward_layer=lambda **kw: (hidden, res, post, comb),
+        )
+        backend = module.MegaKernelModelBackend(session, {"static": 1}, {"stage_limit": 28}, lambda *a: "id")
+        backend.session.bridge = NS(stage_limit=28)
+
+        class FakeGate:
+            verdict = None
+            cache = {}
+
+            def current_step_cache(self):
+                return self.cache
+
+            def get_step_preflight(self):
+                return self.verdict
+
+            def set_step_preflight(self, v):
+                self.verdict = v
+
+            def register_step_cleanup(self, cb):
+                pass
+
+        agree_calls = []
+
+        def fake_agree(err, dev, grp, phase):
+            agree_calls.append((err, dev, grp, phase))
+            raise module.MegaKernelCollectiveError("group abort") from err
+
+        mhc_mod = ModuleType("vllm_ascend.models.glm5next.ops.mhc_ops")
+        mhc_mod.hc_contract = lambda x, n: x
+        coord = module.StepDecodeCoordinator(
+            gate=FakeGate(),
+            pool=None,
+            control_device="cpu",
+            control_group="ctrl",
+            layer_entries=[(layer, backend)],
+            defer_state_commit=False,
+        )
+        module.DecodeLayerAdapter(
+            backend, lambda l, e: True, lambda: "eager", lambda l: True, coordinator=coord
+        ).install(layer)
+        stubs = self._external_stubs(ctx)
+        stubs["vllm_ascend.models.glm5next.ops.mhc_ops"] = mhc_mod
+        fake_npu = NS(current_stream=lambda d: NS(npu_stream=1, synchronize=lambda: None))
+        with (
+            patch.dict(sys.modules, stubs),
+            patch.object(module, "coordinate_layer_preflight", lambda *a, **k: True),
+            patch.object(module, "agree_or_abort", side_effect=fake_agree),
+            patch.object(torch, "npu", fake_npu, create=True),
+            self.assertRaises(module.MegaKernelCollectiveError),
+        ):
+            layer.forward(None, hidden, None, None, None)
+        self.assertEqual(len(agree_calls), 1)
+        self.assertIsInstance(agree_calls[0][0], RuntimeError)
+        self.assertEqual(agree_calls[0][1:], ("cpu", "ctrl", "model final layer contraction"))
+
+    def test_hccl_domain_inspector_supports_two_and_three_groups(self):
+        collectives_path = Path(__file__).resolve().parents[3] / "vllm_ascend/models/glm5next/mega_kernel_collectives.py"
+        collectives_spec = importlib.util.spec_from_file_location("inspector_collectives_test", collectives_path)
+        collectives = importlib.util.module_from_spec(collectives_spec)
+        collectives_spec.loader.exec_module(collectives)
+
+        import ctypes as C
+
+        class FakeFunc:
+            def __init__(self, fn):
+                self._fn = fn
+                self.argtypes = None
+                self.restype = None
+
+            def __call__(self, *args):
+                return self._fn(*args)
+
+        def _set_ptr(out_ptr, ctype, val):
+            if hasattr(out_ptr, "_obj"):
+                out_ptr._obj.value = val
+            else:
+                C.cast(out_ptr, C.POINTER(ctype))[0] = val
+
+        class FakeLib:
+            def __init__(self, handles):
+                self._handles = handles
+                self.HcclCommGetHandleWithName = FakeFunc(self._get_handle)
+                self.HcclGetRankId = FakeFunc(self._get_rank)
+                self.HcclGetRankSize = FakeFunc(self._get_size)
+
+            def _get_handle(self, name_bytes, out_ptr):
+                key = name_bytes.decode()
+                if key not in self._handles:
+                    return 1
+                _set_ptr(out_ptr, C.c_void_p, self._handles[key])
+                return 0
+
+            def _get_rank(self, handle, out_ptr):
+                _set_ptr(out_ptr, C.c_uint32, 2)
+                return 0
+
+            def _get_size(self, handle, out_ptr):
+                _set_ptr(out_ptr, C.c_uint32, 8)
+                return 0
+
+        handles = {"ctrl_comm": 0x1000, "tp_comm": 0x1001, "ep_comm": 0x1002}
+        fake_lib = FakeLib(handles)
+
+        def make_group(name):
+            return NS(_get_backend=lambda dev: NS(get_hccl_comm_name=lambda r: name))
+
+        with (
+            patch.object(collectives.C, "CDLL", return_value=fake_lib),
+            patch.object(collectives.dist, "get_rank", return_value=2),
+            patch.object(collectives.dist, "get_world_size", return_value=8),
+        ):
+            inspector = collectives.HcclDomainInspector()
+            names = inspector.inspect((make_group("tp_comm"), make_group("ep_comm")), "cpu", 2, 8)
+            self.assertEqual(names, ("tp_comm", "ep_comm"))
+            names3 = inspector.inspect((make_group("ctrl_comm"), make_group("tp_comm"), make_group("ep_comm")), "cpu", 2, 8)
+            self.assertEqual(names3, ("ctrl_comm", "tp_comm", "ep_comm"))
+            with self.assertRaisesRegex(ValueError, "distinct"):
+                inspector.inspect((make_group("tp_comm"), make_group("tp_comm")), "cpu", 2, 8)
 
 
 if __name__ == "__main__":

@@ -319,7 +319,7 @@ class SessionAndPoolTests(unittest.TestCase):
         self.assertIsNot(b0.bank, b1.bank)
         self.assertIs(b0.bank, b2.bank)
         self.assertEqual(syncs, [])
-        self.assertEqual(reduce_calls, [1])
+        self.assertEqual(reduce_calls, [1, 1])
         self.assertEqual([h.run_calls for h in prepared_handles], [1, 1, 1])
         self.assertIsNone(sessions[0].last_route_ids)
 
@@ -605,6 +605,150 @@ class SessionAndPoolTests(unittest.TestCase):
                 defer_commit=False,
             )
             self.assertIsNone(sess.last_route_ids)
+
+    def test_compute_and_control_device_separation_and_close_device(self):
+        pool = self.module.SharedStepBufferPool(torch.device("cpu"), max_cached_geometries=4, control_device="cpu")
+        self.assertEqual(pool.get_agree_scratch().device.type, "cpu")
+        self.assertEqual(pool.get_preflight_scratch().device.type, "cpu")
+        self.assertEqual(pool.get_step_contract_scratch().device.type, "cpu")
+
+        fake_npu_dev = torch.device("meta")
+        pool_sep = self.module.SharedStepBufferPool(fake_npu_dev, max_cached_geometries=4, control_device="cpu")
+        self.assertEqual(pool_sep.device.type, "meta")
+        self.assertEqual(pool_sep.control_device.type, "cpu")
+        self.assertEqual(pool_sep.get_agree_scratch().device.type, "cpu")
+        self.assertEqual(pool_sep.get_preflight_scratch().device.type, "cpu")
+        self.assertEqual(pool_sep.get_step_contract_scratch().device.type, "cpu")
+
+        seen_devices = []
+        sess = self._make_session(
+            pool,
+            0,
+            0,
+            None,
+            config=self._make_config(control_device=torch.device("cpu"), compute_device=torch.device("cpu")),
+        )
+
+        def capture_agree(error, device, group, phase, *, scratch=None):
+            seen_devices.append((torch.device(device), phase))
+
+        with patch.object(self.module, "agree_or_abort", side_effect=capture_agree):
+            sess.close()
+        self.assertEqual(seen_devices, [(torch.device("cpu"), "MC2 session teardown")])
+
+    def test_finalize_step_always_coordinates_commit_and_handles_status_exception(self):
+        pool = self.module.SharedStepBufferPool("cpu", max_cached_geometries=2)
+        stream = SimpleNamespace(npu_stream=606, synchronize=lambda: None)
+        fake_npu = SimpleNamespace(current_stream=lambda dev: stream)
+        sess = self._make_session(
+            pool,
+            0,
+            0,
+            None,
+            config=self._make_config(sync_per_layer=True),
+            op=lambda *a: (
+                [o.zero_() if idx in self.module.STATUS_OUTPUT_INDICES else o.fill_(1.0) for idx, o in enumerate(a[1])]
+                and a[1]
+            ),
+        )
+        c = torch.zeros(4, 3, 384, dtype=torch.bfloat16)
+        r = torch.zeros(4, 1, 128, 128, dtype=torch.float32)
+        slots = torch.tensor([0, 1], dtype=torch.int64)
+        agree_calls = []
+
+        def fake_agree(err, dev, grp, phase, *, scratch=None):
+            agree_calls.append((err, phase))
+            if phase == "MC2 deferred state commit":
+                raise self.module.MegaKernelCollectiveError("peer failed commit")
+
+        with (
+            patch.object(torch, "npu", fake_npu, create=True),
+            patch.object(torch.distributed, "all_reduce", side_effect=lambda *a, **k: None),
+            patch.object(self.module, "agree_or_abort", side_effect=fake_agree),
+        ):
+            sess.forward_layer(
+                hidden_states=torch.ones(2, 4096, dtype=torch.bfloat16),
+                residual=None,
+                post=None,
+                comb=None,
+                conv_state=c,
+                recurrent_state=r,
+                conv_slots_i64=slots,
+                rec_slots_i64=slots,
+                is_first_layer=True,
+                defer_commit=True,
+            )
+            with self.assertRaises(self.module.MegaKernelCollectiveError):
+                pool.finalize_step("cpu", SimpleNamespace())
+        self.assertEqual(agree_calls, [(None, "MC2 deferred state commit")])
+        self.assertTrue(sess._failed)
+
+        # If checking status buffers raises before all_reduce, finalize_step must
+        # still invoke all_reduce with 1 so peers never hang waiting in the vote.
+        pool2 = self.module.SharedStepBufferPool("cpu", max_cached_geometries=2)
+        bad_entry = self.module._PendingCommit(
+            session=self._make_session(pool2, 0, 0, None),
+            prov_conv=torch.zeros(1),
+            prov_rec=torch.zeros(1),
+            dst_conv=torch.zeros(1),
+            dst_rec=torch.zeros(1),
+            conv_slots=slots,
+            rec_slots=slots,
+            conv_writeback=None,
+            status_buffers=(SimpleNamespace(),),  # status_tensor != 0 fails cleanly inside try
+        )
+        pool2._pending.append(bad_entry)
+        seen_flags = []
+
+        def capture_reduce(tensor, op=None, group=None):
+            seen_flags.append(int(tensor.item()))
+
+        with (
+            patch.object(torch.distributed, "all_reduce", side_effect=capture_reduce),
+            self.assertRaises(self.module.MegaKernelCollectiveError),
+        ):
+            pool2.finalize_step("cpu", SimpleNamespace())
+        self.assertEqual(seen_flags, [1])
+
+    def test_1e591b193d_fallback_consecutive_requests_and_eviction_sync(self):
+        pool = self.module.SharedStepBufferPool("cpu", max_cached_geometries=2)
+        syncs = []
+        stream = SimpleNamespace(npu_stream=707, synchronize=lambda: syncs.append("sync"))
+        fake_npu = SimpleNamespace(current_stream=lambda dev: stream)
+        sess = self._make_session(
+            pool,
+            0,
+            0,
+            None,
+            config=self._make_config(sync_per_layer=True),
+            op=lambda *a: (
+                [o.zero_() if idx in self.module.STATUS_OUTPUT_INDICES else o.fill_(1.0) for idx, o in enumerate(a[1])]
+                and a[1]
+            ),
+        )
+        self.assertIs(sess.capture_routes, False)
+        with (
+            patch.object(torch, "npu", fake_npu, create=True),
+            patch.object(torch.distributed, "all_reduce", side_effect=lambda *a, **k: None),
+        ):
+            for rows in (1, 1, 2, 3):
+                c = torch.zeros(4, 3, 384, dtype=torch.bfloat16)
+                r = torch.zeros(4, 1, 128, 128, dtype=torch.float32)
+                slots = torch.arange(rows, dtype=torch.int64)
+                sess.forward_layer(
+                    hidden_states=torch.ones(rows, 4096, dtype=torch.bfloat16),
+                    residual=None,
+                    post=None,
+                    comb=None,
+                    conv_state=c,
+                    recurrent_state=r,
+                    conv_slots_i64=slots,
+                    rec_slots_i64=slots,
+                    is_first_layer=True,
+                    defer_commit=False,
+                )
+        self.assertEqual(len(syncs), 4)
+        self.assertEqual(list(pool._buckets.keys()), [(2, 707), (3, 707)])
 
 
 if __name__ == "__main__":

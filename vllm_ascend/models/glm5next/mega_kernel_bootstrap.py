@@ -136,6 +136,13 @@ def _opt_bool(cfg: dict[str, Any], key: str, default: bool) -> bool:
     return val
 
 
+def _opt_optional_bool(cfg: dict[str, Any], key: str) -> bool | None:
+    val = cfg.get(key)
+    if val is not None and type(val) is not bool:
+        raise ValueError(f"{key} must be a boolean")
+    return val
+
+
 def _opt_pos_int(cfg: dict[str, Any], key: str, default: int) -> int:
     val = cfg.get(key, default)
     if type(val) is not int or val < 1:
@@ -151,9 +158,7 @@ def _verify_layer_weights_startup(
     tp_rank: int,
     ep_rank: int,
     world: int,
-    control: Any,
-    device: Any,
-) -> None:
+) -> tuple[str, bytes]:
     validate_projection_shapes(weights, heads)
     shared_width = int(manifest_item["model_shared_intermediate"])
     local_shared_width = int(weights["expert_down_weight"].shape[1])
@@ -174,14 +179,10 @@ def _verify_layer_weights_startup(
         if name not in HEAD_FIELDS and name not in SHARED_FIELDS and weights.get(name) is not None
     ]
     rep_hash = tensor_sha256(rep_fields).hex()
-    digest_agreement(rep_hash.encode("ascii"), device, control, "startup replicated weight contract")
-    expected_rep = manifest_item.get("observed_replicated_digest")
-    if isinstance(expected_rep, str) and rep_hash != expected_rep:
-        raise ValueError("replicated weights differ from manifest digest")
     fa_ga_fields = [("f_g_a", weights["projection_weight"][-256:])]
     if weights.get("in_projection_scale") is not None:
         fa_ga_fields.append(("f_g_a_scale", weights["in_projection_scale"][-256:]))
-    digest_agreement(tensor_sha256(fa_ga_fields), device, control, "startup replicated f_a/g_a projection")
+    return rep_hash, tensor_sha256(fa_ga_fields)
 
 
 def bootstrap(runner: Any, config_path: str):
@@ -211,10 +212,10 @@ def bootstrap(runner: Any, config_path: str):
         ):
             raise ValueError("requires PP1 and full-world ordered TP=EP in this bootstrap")
         repeatable_executor = _opt_bool(cfg, "repeatable_executor", True)
-        sync_per_layer = _opt_bool(cfg, "sync_per_layer", False)
+        sync_per_layer_cfg = _opt_optional_bool(cfg, "sync_per_layer")
         consumer_readback = _opt_bool(cfg, "consumer_readback", False)
         defer_state_commit = _opt_bool(cfg, "defer_state_commit", True)
-        max_cached_geometries = _opt_pos_int(cfg, "max_cached_geometries", 2)
+        max_cached_geometries = _opt_pos_int(cfg, "max_cached_geometries", 8)
         header_path = Path(cfg["generated_header_path"])
         if not header_path.is_absolute() or not header_path.is_file():
             raise ValueError("generated_header_path must be an existing absolute file")
@@ -254,10 +255,13 @@ def bootstrap(runner: Any, config_path: str):
     if local_error is not None:
         raise local_error
 
-    control = dist.new_group(ranks=members, backend="hccl")
+    # Isolate MC2 control-plane consensus onto CPU Gloo so host coordination
+    # never interleaves with device HCCL / AICPU streams during Decode steps.
+    control = dist.new_group(ranks=members, backend="gloo")
+    control_device = torch.device("cpu")
     tp = dist.new_group(ranks=members, backend="hccl")
     ep = dist.new_group(ranks=members, backend="hccl")
-    digest_agreement(cfg_raw + b"\0" + manifest_raw, device, control, "MC2 bootstrap config and manifest")
+    digest_agreement(cfg_raw + b"\0" + manifest_raw, control_device, control, "MC2 bootstrap config and manifest")
     all_ids = [None] * world
     dist.all_gather_object(all_ids, ids, group=control)
     if any(x != ids for x in all_ids):
@@ -297,28 +301,30 @@ def bootstrap(runner: Any, config_path: str):
             50,
         )
         abi.validate()
-        names = HcclDomainInspector().inspect((control, tp, ep), device, rank, world)
-        for group, count in ((tp, world), (ep, world)):
-            ping = torch.ones(16, dtype=torch.float32, device=device)
-            dist.all_reduce(ping, group=group)
-            if not bool(torch.all(ping == count).item()):
-                raise ValueError("HCCL domain warmup mismatch")
+        tp_name, ep_name = HcclDomainInspector().inspect((tp, ep), device, rank, world)
         op, prepare_fn = load_torch_mc2_extension()
     except Exception as exc:
         local_error = exc
-    agree_or_abort(local_error, device, control, "MC2 manifest and HCCL domain admission")
+    agree_or_abort(local_error, control_device, control, "MC2 manifest and HCCL domain admission")
     if local_error is not None:
         raise local_error
+    for group, count in ((tp, world), (ep, world)):
+        ping = torch.ones(16, dtype=torch.float32, device=device)
+        dist.all_reduce(ping, group=group)
+        if not bool(torch.all(ping == count).item()):
+            raise ValueError("HCCL domain warmup mismatch")
+    digest_agreement(json.dumps(tp_name).encode("utf-8"), device, tp, "MC2 TP domain name")
+    digest_agreement(json.dumps(ep_name).encode("utf-8"), device, ep, "MC2 EP domain name")
+    torch.npu.synchronize(device)
 
-    digest_agreement(json.dumps(names[0]).encode("utf-8"), device, control, "MC2 control domain name")
-    digest_agreement(json.dumps(names[1]).encode("utf-8"), device, tp, "MC2 TP domain name")
-    digest_agreement(json.dumps(names[2]).encode("utf-8"), device, ep, "MC2 EP domain name")
+    use_repeatable = repeatable_executor and prepare_fn is not None
+    sync_per_layer = (not use_repeatable) if sync_per_layer_cfg is None else sync_per_layer_cfg
 
-    pool = SharedStepBufferPool(device, max_cached_geometries=max_cached_geometries)
+    pool = SharedStepBufferPool(device, max_cached_geometries=max_cached_geometries, control_device=control_device)
     step_contract_scratch = pool.get_step_contract_scratch()
     sequence = [0]
 
-    def agree_step(accepted, step_digest, rows):
+    def agree_step(accepted, step_digest, rows, local_error=None):
         same, _ = agree_decode_step_contract(
             accepted,
             rows,
@@ -326,9 +332,10 @@ def bootstrap(runner: Any, config_path: str):
             abi.max_rows_per_source,
             abi.max_total_rows,
             world,
-            device,
+            control_device,
             control,
             scratch=step_contract_scratch,
+            local_error=local_error,
         )
         if same:
             if sequence[0] >= 2**31 - 1:
@@ -340,7 +347,6 @@ def bootstrap(runner: Any, config_path: str):
 
     sessions, layer_backends = [], []
     prop_rounds = admission_control(1, world, True)
-    tp_name, ep_name = names[1], names[2]
     for ordinal, layer in enumerate(layers):
         item = manifest["layers"][str(layer.layer_idx)]
         local_error = None
@@ -354,15 +360,13 @@ def bootstrap(runner: Any, config_path: str):
             )
             weights = _reuse_or_align_weights(weights, device, check_abi_tensor, aligned_copy)
             _check_attrs(layer, item["attrs"], 28, world)
-            _verify_layer_weights_startup(
+            rep_hash, fa_ga_digest = _verify_layer_weights_startup(
                 weights,
                 item,
                 heads=heads,
                 tp_rank=head_rank,
                 ep_rank=rank,
                 world=world,
-                control=control,
-                device=device,
             )
             sc = Mc2SessionConfig(
                 cfg["opapi_path"],
@@ -374,7 +378,7 @@ def bootstrap(runner: Any, config_path: str):
                 control,
                 tp,
                 ep,
-                device,
+                control_device,
                 cfg["tp_algorithm"],
                 cfg["ep_algorithm"],
                 tuple(item["expert_shard_digests"]),
@@ -394,6 +398,7 @@ def bootstrap(runner: Any, config_path: str):
                 ep_rank=rank,
                 propagation_rounds=prop_rounds,
                 generated_header_sha256=header_hash,
+                compute_device=device,
             )
             epoch = manifest["model_digest"] + ":" + str(layer.layer_idx)
             session = create_torch_session(
@@ -419,15 +424,20 @@ def bootstrap(runner: Any, config_path: str):
             backend.validate_static_once(layer)
         except Exception as exc:
             local_error = exc
-        if not _all_true(local_error is None, device, control):
+        if not _all_true(local_error is None, control_device, control):
             raise RuntimeError(f"group-wide MC2 model bootstrap failed; local error: {local_error}")
+        digest_agreement(rep_hash.encode("ascii"), control_device, control, "startup replicated weight contract")
+        expected_rep = item.get("observed_replicated_digest")
+        if isinstance(expected_rep, str) and rep_hash != expected_rep:
+            raise ValueError("replicated weights differ from manifest digest")
+        digest_agreement(fa_ga_digest, control_device, control, "startup replicated f_a/g_a projection")
         sessions.append(session)
         layer_backends.append((layer, backend))
 
     coordinator = StepDecodeCoordinator(
         gate=_gate,
         pool=pool,
-        control_device=device,
+        control_device=control_device,
         control_group=control,
         layer_entries=layer_backends,
         defer_state_commit=defer_state_commit,
@@ -436,7 +446,7 @@ def bootstrap(runner: Any, config_path: str):
 
     def coordinate(actual_layer, error):
         del actual_layer
-        return coordinate_layer_preflight(error, _gate.is_pure_decode(), device, control, scratch=preflight_scratch)
+        return coordinate_layer_preflight(error, _gate.is_pure_decode(), control_device, control, scratch=preflight_scratch)
 
     def execution_mode():
         return _gate.execution_mode()
@@ -467,7 +477,7 @@ def bootstrap(runner: Any, config_path: str):
                     post,
                     comb,
                     control_group=control,
-                    control_device=device,
+                    control_device=control_device,
                     consumer_ready=consumer_ready,
                     events_join_required_work=True,
                     logical_step_agreed=True,
@@ -486,7 +496,7 @@ def bootstrap(runner: Any, config_path: str):
                         write_error = exc
                 agree_or_abort(
                     write_error,
-                    device,
+                    control_device,
                     control,
                     "single-layer benchmark report",
                     scratch=pool.get_agree_scratch(),
@@ -512,4 +522,5 @@ def bootstrap(runner: Any, config_path: str):
     for layer, adapter in adapters:
         adapter.install(layer)
     runner._megakernel_sessions = sessions
+    torch.npu.synchronize(device)
     return ids

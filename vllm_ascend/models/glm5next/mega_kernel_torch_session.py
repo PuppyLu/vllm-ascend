@@ -115,12 +115,13 @@ class Mc2SessionConfig:
     repeatable_executor: bool = True
     sync_per_layer: bool = False
     defer_state_commit: bool = True
-    max_cached_geometries: int = 2
+    max_cached_geometries: int = 8
     tp_group_name: str | None = None
     ep_group_name: str | None = None
     ep_rank: int | None = None
     propagation_rounds: int = 1
     generated_header_sha256: str | None = None
+    compute_device: Any = None
 
 
 class _TorchBoundBuffers:
@@ -313,10 +314,11 @@ class _PendingCommit:
 class SharedStepBufferPool:
     """Worker-wide bounded LRU pool sharing step buffers, ping-pong banks, workspace, and atomic TX state."""
 
-    def __init__(self, device: Any, max_cached_geometries: int = 2):
+    def __init__(self, device: Any, max_cached_geometries: int = 8, *, control_device: Any = None):
         if type(max_cached_geometries) is not int or max_cached_geometries < 1:
             raise ValueError("max_cached_geometries must be a positive integer")
         self.device = torch.device(device)
+        self.control_device = torch.device(self.device if control_device is None else control_device)
         self.max_cached_geometries = max_cached_geometries
         self._buckets: OrderedDict[tuple[int, int], _GeometryBucket] = OrderedDict()
         self._sessions: list[Any] = []
@@ -332,17 +334,17 @@ class SharedStepBufferPool:
 
     def get_agree_scratch(self) -> torch.Tensor:
         if self._agree_scratch is None:
-            self._agree_scratch = torch.zeros(1, dtype=torch.int32, device=self.device)
+            self._agree_scratch = torch.zeros(1, dtype=torch.int32, device=self.control_device)
         return self._agree_scratch
 
     def get_preflight_scratch(self) -> torch.Tensor:
         if self._preflight_scratch is None:
-            self._preflight_scratch = torch.zeros(1, dtype=torch.int32, device=self.device)
+            self._preflight_scratch = torch.zeros(1, dtype=torch.int32, device=self.control_device)
         return self._preflight_scratch
 
     def get_step_contract_scratch(self) -> torch.Tensor:
         if self._step_contract_scratch is None:
-            self._step_contract_scratch = torch.zeros(35, dtype=torch.int32, device=self.device)
+            self._step_contract_scratch = torch.zeros(35, dtype=torch.int32, device=self.control_device)
         return self._step_contract_scratch
 
     def touch_bucket(self, key: tuple[int, int]) -> None:
@@ -357,6 +359,11 @@ class SharedStepBufferPool:
             return bucket
         if self._pending:
             raise RuntimeError("cannot evict or allocate a new geometry bucket while a step transaction is pending")
+        if len(self._buckets) >= self.max_cached_geometries and self.device.type == "npu" and hasattr(torch, "npu"):
+            stream = torch.npu.current_stream(self.device)
+            sync = getattr(stream, "synchronize", None)
+            if callable(sync):
+                sync()
         while len(self._buckets) >= self.max_cached_geometries:
             evicted_key, _ = self._buckets.popitem(last=False)
             for session in self._sessions:
@@ -393,23 +400,28 @@ class SharedStepBufferPool:
             return
         pending = self._pending
         ctrl_device = torch.device(control_device)
+        scratch = self.get_agree_scratch() if ctrl_device == self.control_device else None
         try:
+            check_error: Exception | None = None
+            local_bad = 1
             if local_error is None and pending:
-                checks = []
-                for entry in pending:
-                    for status_tensor in entry.status_buffers:
-                        checks.append(torch.any(status_tensor != 0))
-                dev_bad = torch.any(torch.stack(checks)).to(device=ctrl_device, dtype=torch.int32).reshape(1)
-            elif self.device == ctrl_device:
-                dev_bad = self.get_agree_scratch()
-                dev_bad[0] = 1
-            else:
-                dev_bad = torch.ones(1, dtype=torch.int32, device=ctrl_device)
-            torch.distributed.all_reduce(dev_bad, op=torch.distributed.ReduceOp.MAX, group=control_group)
-            if bool(dev_bad.item()):
+                try:
+                    checks = []
+                    for entry in pending:
+                        for status_tensor in entry.status_buffers:
+                            checks.append(torch.any(status_tensor != 0))
+                    local_bad = int(bool(torch.any(torch.stack(checks)).item()))
+                except Exception as exc:
+                    check_error = exc
+                    local_bad = 1
+            cause = local_error if local_error is not None else check_error
+            flag = scratch if scratch is not None else torch.empty(1, dtype=torch.int32, device=ctrl_device)
+            flag[0] = local_bad
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX, group=control_group)
+            if bool(flag.item()):
                 raise MegaKernelCollectiveError(
                     "MC2 step status or execution check failed on at least one rank; abort job without state commit"
-                ) from local_error
+                ) from cause
             commit_error = None
             try:
                 for entry in pending:
@@ -419,15 +431,15 @@ class SharedStepBufferPool:
                         entry.conv_writeback.copy_(entry.dst_conv)
             except Exception as exc:
                 commit_error = exc
-            if commit_error is not None:
-                agree_or_abort(
-                    commit_error,
-                    control_device,
-                    control_group,
-                    "MC2 deferred state commit",
-                    scratch=self.get_agree_scratch(),
-                )
-                raise commit_error
+            # All ranks must unconditionally participate in commit agreement so a
+            # local commit failure on one rank never deadlocks peers.
+            agree_or_abort(
+                commit_error,
+                ctrl_device,
+                control_group,
+                "MC2 deferred state commit",
+                scratch=scratch,
+            )
             self._pending = []
         except BaseException:
             self._mark_sessions_failed()
@@ -501,8 +513,12 @@ class MegaKernelTorchSession:
         self.heads_per_shard = config.heads_per_shard
         self.stage_limit = stage_limit
         self.protocol = protocol
-        self.device = torch.device(config.control_device)
-        self.pool = buffer_pool or SharedStepBufferPool(self.device, config.max_cached_geometries)
+        compute_dev = config.compute_device if config.compute_device is not None else config.control_device
+        self.device = torch.device(compute_dev)
+        self.control_device = torch.device(config.control_device)
+        self.pool = buffer_pool or SharedStepBufferPool(
+            self.device, config.max_cached_geometries, control_device=self.control_device
+        )
         self.pool.register_session(self)
         self.bridge = bridge or _LegacyBridgeInfo(protocol, stage_limit, header_sha, config.heads_per_shard)
         self._epoch: str | None = None
@@ -757,7 +773,7 @@ class MegaKernelTorchSession:
                 single_tx_pending = self.pool._pending
                 self.pool._pending = [entry]
                 try:
-                    self.pool.finalize_step(self.config.control_device, self.config.control_group)
+                    self.pool.finalize_step(self.control_device, self.config.control_group)
                 finally:
                     self.pool._pending = single_tx_pending
             if clone_outputs:
@@ -831,7 +847,7 @@ class MegaKernelTorchSession:
             prev_pending = self.pool._pending
             self.pool._pending = [entry]
             try:
-                self.pool.finalize_step(self.config.control_device, self.config.control_group)
+                self.pool.finalize_step(self.control_device, self.config.control_group)
             finally:
                 self.pool._pending = prev_pending
             output = aligned_copy(out[37])
@@ -865,12 +881,13 @@ class MegaKernelTorchSession:
                     if close_error is None:
                         close_error = exc
             self._bindings.clear()
+            scratch = self.pool.get_agree_scratch() if self.control_device == self.pool.control_device else None
             agree_or_abort(
                 close_error,
-                self.device,
+                self.control_device,
                 self.config.control_group,
                 "MC2 session teardown",
-                scratch=self.pool.get_agree_scratch(),
+                scratch=scratch,
             )
             if close_error is not None:
                 raise close_error

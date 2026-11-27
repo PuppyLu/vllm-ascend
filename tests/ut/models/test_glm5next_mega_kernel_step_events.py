@@ -198,7 +198,7 @@ class SchedulerHookIntegrationTests(unittest.TestCase):
         desc = NS(cg_mode=NS(name="NONE"))
         runner.desc = desc
         gate = scheduler.V2SchedulerEvidence(Runner, capture_guard=lambda: True)
-        gate.set_step_agreement(lambda accepted, digest: accepted and isinstance(digest, str))
+        gate.set_step_agreement(lambda accepted, digest, error: accepted and isinstance(digest, str))
         gate.install()
         hook = _MOD.V2DecodeStepHook(
             Runner,

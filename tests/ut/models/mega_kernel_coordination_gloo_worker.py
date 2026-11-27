@@ -8,10 +8,11 @@ import importlib.util
 import sys
 import tempfile
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
@@ -27,6 +28,7 @@ def _load_stack():
             importlib.import_module("vllm_ascend.models.glm5next.mega_kernel_weights"),
             importlib.import_module("vllm_ascend.models.glm5next.mega_kernel_torch_session"),
             importlib.import_module("vllm_ascend.models.glm5next.mega_kernel_adapter"),
+            importlib.import_module("vllm_ascend.models.glm5next.mega_kernel_scheduler"),
         )
     modules = {}
     for pkg in ("vllm_ascend", "vllm_ascend.models", "vllm_ascend.models.glm5next"):
@@ -40,6 +42,7 @@ def _load_stack():
         "mega_kernel_weights",
         "mega_kernel_torch_session",
         "mega_kernel_adapter",
+        "mega_kernel_scheduler",
     ):
         fq = f"vllm_ascend.models.glm5next.{name}"
         spec = importlib.util.spec_from_file_location(fq, GLM5NEXT_DIR / f"{name}.py")
@@ -51,7 +54,91 @@ def _load_stack():
     return tuple(loaded)
 
 
-abi, coord, weights_mod, session_mod, adapter = _load_stack()
+abi, coord, weights_mod, session_mod, adapter, scheduler = _load_stack()
+
+
+def check_final_output_coordination(rank, world_size):
+    """Non-output-rank final mHC errors must stop every rank before logits."""
+    mhc_name = "vllm_ascend.models.glm5next.ops.mhc_ops"
+    mhc = ModuleType(mhc_name)
+    small_input_names = (
+        "x",
+        "post_h_res",
+        "post_h_out",
+        "post_h_post",
+        "conv_state",
+        "recurrent_state",
+        "cu_seqlens",
+        "state_indices",
+    )
+    old_npu = getattr(torch, "npu", None)
+    state = {"mode": "none", "syncs": 0}
+
+    def synchronize():
+        state["syncs"] += 1
+        if state["mode"] == "sync" and rank == 1:
+            raise RuntimeError("injected final stream failure")
+
+    def contract(value, n):
+        if state["mode"] == "contract" and rank == 1:
+            raise RuntimeError("injected final contract failure")
+        return value * n
+
+    mhc.hc_contract = contract
+    torch.npu = SimpleNamespace(current_stream=lambda device: SimpleNamespace(synchronize=synchronize))
+    session = SimpleNamespace(
+        config=SimpleNamespace(control_device="cpu", control_group=dist.group.WORLD),
+        forward=lambda *a, **k: (torch.ones(1, 2), torch.zeros(1, 4, 2), torch.zeros(1, 4, 1), torch.zeros(1, 4, 4)),
+    )
+    backend = adapter.MegaKernelModelBackend(session, {}, {}, lambda *a: None)
+    decode = SimpleNamespace(
+        rows=1,
+        conv_state=torch.zeros(1),
+        conv_writeback=None,
+        recurrent_state=torch.zeros(1),
+        cu_seqlens=torch.zeros(1),
+        state_indices=torch.zeros(1),
+    )
+    args = (torch.ones(1, 2), torch.zeros(1, 4, 2), torch.zeros(1, 4, 1), torch.zeros(1, 4, 4), decode)
+    try:
+        with (
+            patch.dict(sys.modules, {mhc_name: mhc}),
+            patch.object(adapter, "MC2_INPUT_NAMES", small_input_names),
+            patch.object(adapter, "aligned_empty", lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)),
+        ):
+            for mode in ("none", "post", "contract", "sync"):
+                state["mode"] = mode
+
+                def hc_post(output, *unused):
+                    if state["mode"] == "post" and rank == 1:
+                        raise RuntimeError("injected final mHC failure")
+                    return output + 2
+
+                layer = SimpleNamespace(layer_idx=1, num_hidden_layers=2, n=4, hc_post=hc_post)
+                result, failed = None, False
+                try:
+                    result = backend(layer, None, *args)
+                except coord.MegaKernelCollectiveError:
+                    failed = True
+                outcomes = [None] * world_size
+                dist.all_gather_object(outcomes, failed)
+                assert outcomes == [mode != "none"] * world_size, (rank, mode, outcomes)
+                if mode == "none":
+                    torch.testing.assert_close(result[0], torch.full((1, 2), 12.0))
+                    assert result[1:] == (None, None, None)
+            # A middle layer retains its deferred mHC tuple and does not add a
+            # final-output stream synchronization.
+            state["mode"] = "none"
+            prior_syncs = state["syncs"]
+            layer = SimpleNamespace(layer_idx=1, num_hidden_layers=3, n=4, hc_post=lambda *a: None)
+            result = backend(layer, None, *args)
+            torch.testing.assert_close(result[0], torch.ones(1, 2))
+            assert state["syncs"] == prior_syncs
+    finally:
+        if old_npu is None:
+            del torch.npu
+        else:
+            torch.npu = old_npu
 
 
 def run(rank, rendezvous, world_size):
@@ -92,8 +179,110 @@ def run(rank, rendezvous, world_size):
             results = [None] * world_size
             dist.all_gather_object(results, result)
             assert results == [expected] * world_size, (rank, results, expected)
+        # Real rank collectives around successive model requests: an eligible
+        # decode, a group fallback when one rank observes prefill, and another
+        # request must all leave the gate reusable. An actual prepare failure
+        # on one rank must abort peers instead of stranding them in the vote.
+        ids = ["req-a", "req-b"]
+        req = SimpleNamespace(
+            req_ids=ids,
+            num_scheduled_tokens=np.array([1, 1]),
+            is_prefilling_np=np.zeros(2, dtype=bool),
+            prefill_runs_as_decode_np=None,
+            prefill_len_np=np.array([5, 7]),
+            num_computed_prefill_tokens_np=np.array([5, 7]),
+        )
+        batch = SimpleNamespace(
+            req_ids=ids,
+            is_dummy=False,
+            num_reqs=2,
+            num_tokens=2,
+            num_tokens_after_padding=2,
+            num_draft_tokens=0,
+            num_computed_tokens_np=np.array([9, 12]),
+        )
+        desc = SimpleNamespace(cg_mode=SimpleNamespace(name="NONE"))
+        output = SimpleNamespace(num_scheduled_tokens=dict.fromkeys(ids, 1), scheduled_spec_decode_tokens={})
 
-        # Missing route-capture API on one rank must abort all participants before launch.
+        class Runner:
+            pcp_manager = None
+            vllm_config = SimpleNamespace(
+                model_config=SimpleNamespace(enforce_eager=True),
+                compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="NONE")),
+            )
+
+            def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
+                if self.inject_error:
+                    raise RuntimeError("injected prepare error")
+                return batch
+
+            def execute_model(self, scheduler_output, dummy_run=False, is_profile=False):
+                self.prepare_inputs(scheduler_output, req, desc)
+                return gate.is_pure_decode()
+
+        gate = scheduler.V2SchedulerEvidence(Runner, capture_guard=lambda: True)
+        gate.set_step_agreement(
+            lambda accepted, digest, error: coord.agree_decode_step(
+                accepted, digest, "cpu", dist.group.WORLD, local_error=error
+            )
+        )
+        gate.install()
+        runner = Runner()
+        runner.inject_error = False
+        try:
+            assert runner.execute_model(output)
+            assert not gate.is_pure_decode()
+            req.is_prefilling_np[0] = rank == 1
+            assert not runner.execute_model(output)
+            # Finish the first batch and admit a different request set and
+            # geometry, as happens when a subsequent user request arrives.
+            next_ids = ["req-c", "req-d", "req-e"]
+            req.req_ids = next_ids
+            req.num_scheduled_tokens = np.ones(3, dtype=np.int64)
+            req.is_prefilling_np = np.zeros(3, dtype=bool)
+            req.prefill_len_np = np.array([2, 4, 6])
+            req.num_computed_prefill_tokens_np = np.array([2, 4, 6])
+            batch.req_ids = next_ids
+            batch.num_reqs = batch.num_tokens = batch.num_tokens_after_padding = 3
+            batch.num_computed_tokens_np = np.array([3, 5, 7])
+            output.num_scheduled_tokens = dict.fromkeys(next_ids, 1)
+            assert runner.execute_model(output)
+            runner.inject_error = rank == 1
+            try:
+                runner.execute_model(output)
+            except coord.MegaKernelCollectiveError:
+                pass
+            else:
+                raise AssertionError("all ranks must abort on one rank's prepare failure")
+            runner.inject_error = False
+
+            def capture_guard():
+                if rank == 1:
+                    raise RuntimeError("injected capture guard failure")
+                return True
+
+            gate.capture_guard = capture_guard
+            try:
+                runner.execute_model(output)
+            except coord.MegaKernelCollectiveError:
+                pass
+            else:
+                raise AssertionError("all ranks must abort on one rank's capture guard failure")
+        finally:
+            gate.uninstall()
+        # Older MC2 sessions always expose actual route snapshots and do not
+        # implement a switch. Diagnostic capture must not invent one.
+        legacy_session = SimpleNamespace(last_route_ids=None, last_route_weights=None)
+        assert coord.enable_diagnostic_route_capture(legacy_session) is None
+        assert not hasattr(legacy_session, "capture_routes")
+        for previous in (False, True):
+            current = SimpleNamespace(capture_routes=previous)
+            prior = coord.enable_diagnostic_route_capture(current)
+            assert prior is previous and current.capture_routes is True
+            current.capture_routes = prior
+            assert current.capture_routes is previous
+        # A missing route-capture API on one rank must abort all participants
+        # at preparation, before any peer can launch the fused collective.
         cap_session = NS(capture_routes=False) if rank != 1 else NS()
         prior = None
         changed = False
@@ -117,6 +306,8 @@ def run(rank, rendezvous, world_size):
         assert cap_results == [False] * world_size, (rank, cap_results)
         if rank != 1:
             assert cap_session.capture_routes is False
+
+        check_final_output_coordination(rank, world_size)
 
         # Contract collective with rows + SHA-256 digest across both 2-rank and 8-rank groups.
         contract_cases = (

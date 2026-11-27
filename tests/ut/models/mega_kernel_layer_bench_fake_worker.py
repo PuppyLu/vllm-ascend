@@ -27,15 +27,11 @@ def agree(err, dev, group, label):
 collectives.agree_or_abort = agree
 
 
-def enable_capture(session):
-    if session is None or not hasattr(session, "capture_routes"):
-        raise ValueError("MC2 session does not support diagnostic route capture")
-    previous = session.capture_routes
-    session.capture_routes = True
-    return previous
-
-
-collectives.enable_diagnostic_route_capture = enable_capture
+collectives_path = Path(__file__).resolve().parents[3] / "vllm_ascend/models/glm5next/mega_kernel_collectives.py"
+collectives_spec = importlib.util.spec_from_file_location("live_collectives_cpu_test", collectives_path)
+actual_collectives = importlib.util.module_from_spec(collectives_spec)
+collectives_spec.loader.exec_module(actual_collectives)
+collectives.enable_diagnostic_route_capture = actual_collectives.enable_diagnostic_route_capture
 context = install("vllm.forward_context")
 context.get_forward_context = lambda: N()
 install("vllm.distributed")
@@ -199,6 +195,39 @@ result = m.measure(
     samples=1,
 )
 assert result["status"] == "PAIRED_LIVE_LAYER_PASS" and result["device_consumer_snapshot"] is True
+
+# Older runtimes always return actual route snapshots, with no capture flag.
+# Run the real diagnostic path and check that it neither invents the switch
+# nor discards real routes while restoring the model's state.
+legacy_session = N(last_route_weights=None, last_route_ids=None)
+layer._megakernel_session = legacy_session
+result = m.measure(
+    layer,
+    torch.tensor([1, 2]),
+    torch.ones(2, 4),
+    None,
+    None,
+    None,
+    control_group=N(),
+    control_device="cpu",
+    consumer_ready=lambda mode, out: None,
+    events_join_required_work=True,
+    logical_step_agreed=True,
+    expected_rows=2,
+    warmup=0,
+    samples=1,
+)
+assert result["status"] == "PAIRED_LIVE_LAYER_PASS"
+assert not hasattr(legacy_session, "capture_routes")
+assert legacy_session.last_route_ids is not None and legacy_session.last_route_weights is not None
+assert all(torch.equal(t, x) for t, x in zip(layer.self_attn.kv_cache, before))
+
+# Restore a new-style session for the existing failure-path check.
+layer._megakernel_session = N(
+    last_route_weights=legacy_session.last_route_weights,
+    last_route_ids=legacy_session.last_route_ids,
+    capture_routes=False,
+)
 
 
 def bad_fused(*args):

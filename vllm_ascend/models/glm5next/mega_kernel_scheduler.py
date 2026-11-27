@@ -164,7 +164,8 @@ class V2SchedulerEvidence:
         self._wrappers: dict[str, Any] = {}
         self._installed = False
         self._step_agreement = None
-        self._step_agreement_wants_rows = False
+        self._step_agreement_arity = 0
+        self._step_agreement_third_is_error = False
         self._execute_lock = threading.Lock()
 
     def set_step_agreement(self, agreement: Callable[..., bool]) -> None:
@@ -176,7 +177,8 @@ class V2SchedulerEvidence:
             if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
         ]
         self._step_agreement = agreement
-        self._step_agreement_wants_rows = len(params) >= 3
+        self._step_agreement_arity = len(params)
+        self._step_agreement_third_is_error = len(params) == 3 and "error" in params[2].name.lower()
 
     def _current(self) -> _Frame | None:
         frame = _frame.get()
@@ -282,6 +284,8 @@ class V2SchedulerEvidence:
                     except Exception as exc:
                         if cleanup_error is None:
                             cleanup_error = exc
+                frame.step_abort_hooks.clear()
+                frame.step_preflight_verdict = None
                 frame.step_metadata_cache.clear()
                 _frame.reset(token)
                 gate._execute_lock.release()
@@ -290,9 +294,6 @@ class V2SchedulerEvidence:
 
         @functools.wraps(prepare)
         def prepare_inputs(runner: Any, *args: Any, **kwargs: Any):
-            bound = prepare_sig.bind(runner, *args, **kwargs)
-            bound.apply_defaults()
-            batch = prepare(runner, *args, **kwargs)
             frame = _frame.get()
             if (
                 not isinstance(frame, _Frame)
@@ -300,38 +301,56 @@ class V2SchedulerEvidence:
                 or frame.runner is not runner
                 or frame.thread_id != threading.get_ident()
             ):
-                return batch
+                return prepare(runner, *args, **kwargs)
             frame.prepare_calls += 1
             frame.pure = False
             frame.rows = 0
             if not frame.permitted_execute:
                 frame.reason = "dummy or profile"
-                return batch
-            if frame.prepare_calls != 1:
-                raise RuntimeError("multiple prepare calls in one execution are unsupported")
-            if bound.arguments["scheduler_output"] is not frame.scheduler_output:
-                frame.reason = "scheduler object changed"
-            else:
+                return prepare(runner, *args, **kwargs)
+            local_error: Exception | None = None
+            batch = None
+            bound = None
+            try:
+                bound = prepare_sig.bind(runner, *args, **kwargs)
+                bound.apply_defaults()
+                batch = prepare(runner, *args, **kwargs)
+                if frame.prepare_calls != 1:
+                    raise RuntimeError("multiple prepare calls in one execution are unsupported")
+            except Exception as exc:
+                local_error = exc
+                frame.reason = "step_preparation_failed"
+            if local_error is None:
                 try:
-                    req_state = bound.arguments["batch_req_state"]
-                    frame.logical_step_id = _classify(
-                        runner,
-                        frame.scheduler_output,
-                        req_state,
-                        bound.arguments["batch_desc"],
-                        batch,
-                    )
-                    frame.rows = len(req_state.req_ids)
-                    frame.pure = gate.capture_guard() is True
-                    frame.reason = "pure_decode" if frame.pure else "capture_guard_failed"
+                    assert bound is not None
+                    if bound.arguments["scheduler_output"] is not frame.scheduler_output:
+                        frame.reason = "scheduler object changed"
+                    else:
+                        req_state = bound.arguments["batch_req_state"]
+                        frame.logical_step_id = _classify(
+                            runner,
+                            frame.scheduler_output,
+                            req_state,
+                            bound.arguments["batch_desc"],
+                            batch,
+                        )
+                        frame.rows = len(req_state.req_ids)
+                        frame.pure = gate.capture_guard() is True
+                        frame.reason = "pure_decode" if frame.pure else "capture_guard_failed"
                 except EvidenceUnavailable as exc:
                     frame.reason = str(exc)
+                except Exception as exc:
+                    local_error = exc
+                    frame.reason = "step_preparation_failed"
             if gate._step_agreement is not None:
                 # All ranks must execute the same ordinary model step here.
                 # Dummy/profile runs never enter this collective. A transport
                 # failure must be handled by the distributed job watchdog.
-                if gate._step_agreement_wants_rows:
-                    accepted = gate._step_agreement(frame.pure, frame.logical_step_id, frame.rows)
+                if gate._step_agreement_arity >= 4:
+                    accepted = gate._step_agreement(frame.pure, frame.logical_step_id, frame.rows, local_error)
+                elif gate._step_agreement_arity == 3:
+                    third = local_error if gate._step_agreement_third_is_error else frame.rows
+                    accepted = gate._step_agreement(frame.pure, frame.logical_step_id, third)
                 else:
                     accepted = gate._step_agreement(frame.pure, frame.logical_step_id)
                 if type(accepted) is not bool:
@@ -340,6 +359,8 @@ class V2SchedulerEvidence:
                 if not accepted:
                     frame.reason = "group_decode_contract_not_met"
                     frame.rows = 0
+            if local_error is not None:
+                raise local_error
             return batch
 
         self._originals = {"execute_model": execute, "prepare_inputs": prepare}

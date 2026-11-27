@@ -282,10 +282,10 @@ def prepare_decode_inputs(
     else:
         device = hidden_states.device
         stream = int(torch.npu.current_stream(device).npu_stream) if device.type == "npu" else None
-        cache_key = (device, stream)
+        seq_cache_key = (device, stream)
         template = getattr(layer, "_megakernel_seq_template", None)
-        if template is None or template[0] != cache_key:
-            template = (cache_key, torch.tensor([0, 1], dtype=torch.int32, device=device))
+        if template is None or template[0] != seq_cache_key:
+            template = (seq_cache_key, torch.tensor([0, 1], dtype=torch.int32, device=device))
             layer._megakernel_seq_template = template
         cu_seqlens = template[1]
 
@@ -363,7 +363,7 @@ class StepDecodeCoordinator:
             import torch
 
             rows = int(hidden_states.shape[0]) if hasattr(hidden_states, "shape") else 0
-            stream = torch.npu.current_stream(hidden_states.device) if rows > 0 else None
+            stream = torch.npu.current_stream(hidden_states.device) if rows > 0 and hasattr(torch, "npu") else None
             for layer, backend in self.layer_entries:
                 if layer is first_layer:
                     decoded = prepare_decode_inputs(
@@ -415,9 +415,16 @@ class StepDecodeCoordinator:
             raise MegaKernelCollectiveError("coordinator accepted an unsupported step; abort job")
         return True, first_inputs, None
 
-    def finalize_step(self) -> None:
+    def finalize_step(self, *, local_error: Exception | None = None, coordinate_error: bool = False) -> None:
         if self.defer_state_commit and self.pool is not None:
-            self.pool.finalize_step(self.control_device, self.control_group)
+            if local_error is None:
+                self.pool.finalize_step(self.control_device, self.control_group)
+            else:
+                self.pool.finalize_step(self.control_device, self.control_group, local_error=local_error)
+        elif coordinate_error or local_error is not None:
+            agree_or_abort(local_error, self.control_device, self.control_group, "model final layer contraction")
+            if local_error is not None:
+                raise local_error
 
 
 class DecodeLayerAdapter:
@@ -577,6 +584,13 @@ class DecodeLayerAdapter:
 
             wait_for_kv_layer_from_connector(this.self_attn.prefix)
             record_attention_compute_start()
+            deferred_final = (
+                use_step_fast_path
+                and coord is not None
+                and this.layer_idx == coord.last_layer_idx
+                and this.layer_idx == this.num_hidden_layers - 1
+                and isinstance(adapter.backend, MegaKernelModelBackend)
+            )
             if adapter._benchmark_active:
                 out = adapter.backend(
                     this,
@@ -591,6 +605,13 @@ class DecodeLayerAdapter:
                     clone_outputs=True,
                 )
             elif coord is not None:
+                backend_kwargs: dict[str, Any] = {
+                    "defer_commit": coord.defer_state_commit,
+                    "capture_routes": None,
+                    "clone_outputs": False,
+                }
+                if deferred_final:
+                    backend_kwargs["defer_final_contract"] = True
                 out = adapter.backend(
                     this,
                     positions,
@@ -599,17 +620,27 @@ class DecodeLayerAdapter:
                     post,
                     comb,
                     inputs,
-                    defer_commit=coord.defer_state_commit,
-                    capture_routes=None,
-                    clone_outputs=False,
+                    **backend_kwargs,
                 )
             else:
                 out = adapter.backend(this, positions, hidden_states, residual, post, comb, inputs)
             if not isinstance(out, tuple) or len(out) != 4:
                 raise RuntimeError("MC2 backend did not return the layer's four values")
-            maybe_save_kv_layer_to_connector(this.self_attn.prefix, [])
-            if use_step_fast_path and coord is not None and this.layer_idx == coord.last_layer_idx:
-                coord.finalize_step()
+            if deferred_final:
+                assert coord is not None
+                final_error: Exception | None = None
+                try:
+                    out = _finish_final_layer(this, out, hidden_states.device)
+                except Exception as exc:
+                    final_error = exc
+                coord.finalize_step(local_error=final_error, coordinate_error=True)
+                if final_error is not None:
+                    raise final_error
+                maybe_save_kv_layer_to_connector(this.self_attn.prefix, [])
+            else:
+                if use_step_fast_path and coord is not None and this.layer_idx == coord.last_layer_idx:
+                    coord.finalize_step()
+                maybe_save_kv_layer_to_connector(this.self_attn.prefix, [])
             stats["hits"] += 1
             if stats["hits"] == 1:
                 logger.info("MegaKernel layer %s first successful Decode call", this.layer_idx)
@@ -702,6 +733,21 @@ def _validate_internal_router(layer: Any, router: Any) -> None:
         raise UnsupportedDecode("MC2 internal routing requires a correction bias")
 
 
+def _finish_final_layer(layer: Any, result: tuple[Any, Any, Any, Any], device: Any) -> tuple[Any, Any, Any, Any]:
+    """Apply final-layer mHC post/contract and ensure device stream completion before returning logits input."""
+    import torch
+    from vllm_ascend.models.glm5next.ops.mhc_ops import hc_contract
+
+    output, ffn_residual, ffn_post, ffn_comb = result
+    output = hc_contract(layer.hc_post(output, ffn_residual, ffn_post, ffn_comb), layer.n)
+    if hasattr(torch, "npu"):
+        stream = torch.npu.current_stream(device)
+        sync = getattr(stream, "synchronize", None)
+        if callable(sync):
+            sync()
+    return output, None, None, None
+
+
 class MegaKernelModelBackend:
     """Assemble real model tensors and invoke a group-bound MC2 session."""
 
@@ -788,6 +834,7 @@ class MegaKernelModelBackend:
         defer_commit: bool | None = None,
         capture_routes: bool | None = None,
         clone_outputs: bool = False,
+        defer_final_contract: bool = False,
     ) -> tuple[Any, Any, Any, Any]:
         del positions
         import torch
@@ -818,12 +865,21 @@ class MegaKernelModelBackend:
                 defer_commit=defer_commit,
                 clone_outputs=clone_outputs,
             )
-            if layer.layer_idx == layer.num_hidden_layers - 1:
-                from vllm_ascend.models.glm5next.ops.mhc_ops import hc_contract
-
-                output, ffn_residual, ffn_post, ffn_comb = result
-                output = hc_contract(layer.hc_post(output, ffn_residual, ffn_post, ffn_comb), layer.n)
-                return output, None, None, None
+            if layer.layer_idx == layer.num_hidden_layers - 1 and not defer_final_contract:
+                final_error: Exception | None = None
+                try:
+                    result = _finish_final_layer(layer, result, hidden_states.device)
+                except Exception as exc:
+                    final_error = exc
+                agree_or_abort(
+                    final_error,
+                    self.session.config.control_device,
+                    self.session.config.control_group,
+                    "model final layer contraction",
+                )
+                if final_error is not None:
+                    raise final_error
+                return result
             return result
 
         rows = decode.rows
@@ -881,9 +937,18 @@ class MegaKernelModelBackend:
         if error is not None:
             raise error
         if layer.layer_idx == layer.num_hidden_layers - 1:
-            from vllm_ascend.models.glm5next.ops.mhc_ops import hc_contract
-
-            output, ffn_residual, ffn_post, ffn_comb = result
-            output = hc_contract(layer.hc_post(output, ffn_residual, ffn_post, ffn_comb), layer.n)
-            return output, None, None, None
+            final_error = None
+            try:
+                result = _finish_final_layer(layer, result, hidden_states.device)
+            except Exception as exc:
+                final_error = exc
+            agree_or_abort(
+                final_error,
+                self.session.config.control_device,
+                self.session.config.control_group,
+                "model final layer contraction",
+            )
+            if final_error is not None:
+                raise final_error
+            return result
         return result

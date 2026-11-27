@@ -17,7 +17,12 @@ class MegaKernelCollectiveError(RuntimeError):
 
 def enable_diagnostic_route_capture(session):
     """Prepare a local snapshot before the benchmark's all-rank preflight."""
-    if session is None or not hasattr(session, "capture_routes"):
+    if session is None:
+        raise ValueError("MC2 session does not support diagnostic route capture")
+    if not hasattr(session, "capture_routes"):
+        # Older 1e591b193d-era runtimes always capture routes when both attributes exist.
+        if all(hasattr(session, name) for name in ("last_route_ids", "last_route_weights")):
+            return None
         raise ValueError("MC2 session does not support diagnostic route capture")
     previous = session.capture_routes
     session.capture_routes = True
@@ -49,7 +54,11 @@ def agree_preflight(error, pure_decode, device, group, *, scratch=None, unsuppor
     return result == 0
 
 
-def agree_decode_step(accepted, digest, device, group, *, scratch=None):
+def _to_int_list(tensor):
+    return tensor.tolist() if tensor.device.type == "cpu" else tensor.cpu().tolist()
+
+
+def agree_decode_step(accepted, digest, device, group, *, scratch=None, local_error=None):
     """Agree eligibility and the complete ordered-step digest with one reduction.
 
     Hash words are 16-bit values stored in int32, so both signs are safe for
@@ -63,15 +72,22 @@ def agree_decode_step(accepted, digest, device, group, *, scratch=None):
         and len(digest) == 64
         and all(character in "0123456789abcdef" for character in digest)
     )
-    words = [int(digest[i : i + 4], 16) for i in range(0, 64, 4)] if valid else [0] * _DIGEST_WORDS
-    payload = [int(not valid), *words, *(-word for word in words)]
+    words = [int(digest[i : i + 4], 16) for i in range(0, 64, 4)] if (local_error is None and valid) else [0] * _DIGEST_WORDS
+    # An unexpected local preparation failure must abort the whole group
+    # instead of turning into an ordinary fallback on peers.
+    status = 2 if local_error is not None else int(not valid)
+    payload = [status, *words, *(-word for word in words)]
     if scratch is not None:
         values = scratch
         values.copy_(torch.tensor(payload, dtype=torch.int32))
     else:
         values = torch.tensor(payload, dtype=torch.int32, device=device)
     dist.all_reduce(values, op=dist.ReduceOp.MAX, group=group)
-    reduced = values.cpu().tolist()
+    reduced = _to_int_list(values)
+    if reduced[0] >= 2:
+        raise MegaKernelCollectiveError(
+            "model step preparation failed on at least one rank; abort job"
+        ) from local_error
     return reduced[0] == 0 and all(reduced[1 + i] == -reduced[1 + _DIGEST_WORDS + i] for i in range(_DIGEST_WORDS))
 
 
@@ -120,7 +136,7 @@ def agree_decode_step_contract(
     else:
         values = torch.tensor(payload, dtype=torch.int32, device=device)
     dist.all_reduce(values, op=dist.ReduceOp.MAX, group=group)
-    reduced = values.cpu().tolist()
+    reduced = _to_int_list(values)
     if reduced[0] >= 2:
         raise MegaKernelCollectiveError("step contract coordination failed on at least one rank; abort job") from local_error
     if reduced[0] != 0:
@@ -171,12 +187,18 @@ class HcclDomainInspector:
         self._libs = (fwk, lib)
 
     def inspect(self, groups, device, rank, world):
+        if len(groups) < 2:
+            raise ValueError("HCCL domain inspection requires at least TP and EP groups")
         names, handles = [], []
-        tp_world = dist.get_world_size(groups[1])
-        tp_rank = dist.get_rank(groups[1])
-        ep_world = dist.get_world_size(groups[2])
-        ep_rank = dist.get_rank(groups[2])
-        for group, expected in zip(groups, ((rank, world), (tp_rank, tp_world), (ep_rank, ep_world))):
+        if len(groups) == 3:
+            expected_pairs = (
+                (rank, world),
+                (dist.get_rank(groups[1]), dist.get_world_size(groups[1])),
+                (dist.get_rank(groups[2]), dist.get_world_size(groups[2])),
+            )
+        else:
+            expected_pairs = tuple((dist.get_rank(g), dist.get_world_size(g)) for g in groups)
+        for group, expected in zip(groups, expected_pairs):
             name = group._get_backend(device).get_hccl_comm_name(dist.get_rank(group))
             if not isinstance(name, str) or not name or "\0" in name:
                 raise ValueError("bad actual HCCL communicator name")
@@ -192,6 +214,6 @@ class HcclDomainInspector:
                 raise ValueError("HCCL communicator rank/size mismatch")
             names.append(name)
             handles.append(handle.value)
-        if len(set(names)) != 3 or len(set(handles)) != 3:
+        if len(set(names)) != len(groups) or len(set(handles)) != len(groups):
             raise ValueError("actual HCCL communicator domains must be distinct")
         return tuple(names)

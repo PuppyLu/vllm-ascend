@@ -246,9 +246,11 @@ def create_torch_session(config, model_epoch):
     op = torch.ops.cann_ops_transformer.mega_kernel_mc2_out
     admission = _TorchOperatorAdmission(config, op)
     session = RepeatableMegaKernelSession(SimpleNamespace(config=config, bridge=admission), model_epoch)
-    if not hasattr(session, "capture_routes"):
-        raise RuntimeError("MC2 session lacks capture_routes; update the matching ops-transformer runtime")
-    # Route snapshots are needed by the diagnostic layer comparison only.
-    # Avoid making two additional tensor copies on every production layer.
-    session.capture_routes = False
+    if hasattr(session, "capture_routes"):
+        # Newer runtimes allow production to skip diagnostic-only copies.
+        session.capture_routes = False
+    elif not all(hasattr(session, name) for name in ("last_route_ids", "last_route_weights")):
+        raise RuntimeError("MC2 session does not expose route outputs; update the matching ops-transformer runtime")
+    # Older runtimes, including 1e591b193d, always copy route outputs. Do not
+    # invent a capture_routes attribute: assigning it would not disable copies.
     return session

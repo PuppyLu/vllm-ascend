@@ -338,7 +338,7 @@ def measure(
                 stats[mode]["consumer_ready_ms"].append(host_ms)
             return values, state, routed, original_indices
         finally:
-            if capture_routes_changed:
+            if capture_routes_changed and prior_capture_routes is not None:
                 session.capture_routes = prior_capture_routes
             if capture and saved_route is not None:
                 if had_instance_attr:

@@ -15,7 +15,12 @@ class MegaKernelCollectiveError(RuntimeError):
 
 def enable_diagnostic_route_capture(session):
     """Prepare a local snapshot before the benchmark's all-rank preflight."""
-    if session is None or not hasattr(session, "capture_routes"):
+    if session is None:
+        raise ValueError("MC2 session does not support diagnostic route capture")
+    if not hasattr(session, "capture_routes"):
+        # The 1e591b193d runtime always snapshots these actual kernel outputs.
+        if all(hasattr(session, name) for name in ("last_route_ids", "last_route_weights")):
+            return None
         raise ValueError("MC2 session does not support diagnostic route capture")
     previous = session.capture_routes
     session.capture_routes = True

@@ -133,7 +133,21 @@ class BoundBuffersTests(unittest.TestCase):
         self.assertIs(session, created)
         self.assertIs(session.capture_routes, False)
 
-    def test_old_runtime_without_capture_support_is_rejected(self):
+    def test_older_runtime_keeps_always_captured_route_outputs(self):
+        fake_module = SimpleNamespace(_builder=SimpleNamespace(load=lambda: None))
+        namespace = SimpleNamespace(cann_ops_transformer=SimpleNamespace(mega_kernel_mc2_out=self.op))
+        created = SimpleNamespace(last_route_ids=None, last_route_weights=None)
+        with (
+            patch.object(self.module.importlib, "import_module", return_value=fake_module),
+            patch.object(self.module, "_TorchOperatorAdmission", return_value=object()),
+            patch.object(self.module, "RepeatableMegaKernelSession", return_value=created),
+            patch.object(torch, "ops", namespace),
+        ):
+            session = self.module.create_torch_session(object(), lambda: "epoch")
+        self.assertIs(session, created)
+        self.assertFalse(hasattr(session, "capture_routes"))
+
+    def test_runtime_without_any_route_output_support_is_rejected(self):
         fake_module = SimpleNamespace(_builder=SimpleNamespace(load=lambda: None))
         namespace = SimpleNamespace(cann_ops_transformer=SimpleNamespace(mega_kernel_mc2_out=self.op))
         with (
@@ -141,7 +155,7 @@ class BoundBuffersTests(unittest.TestCase):
             patch.object(self.module, "_TorchOperatorAdmission", return_value=object()),
             patch.object(self.module, "RepeatableMegaKernelSession", return_value=SimpleNamespace()),
             patch.object(torch, "ops", namespace),
-            self.assertRaisesRegex(RuntimeError, "update the matching ops-transformer runtime"),
+            self.assertRaisesRegex(RuntimeError, "does not expose route outputs"),
         ):
             self.module.create_torch_session(object(), lambda: "epoch")
 

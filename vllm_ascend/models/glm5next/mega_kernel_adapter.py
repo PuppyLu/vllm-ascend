@@ -45,7 +45,8 @@ def coordinate_layer_preflight(error: Exception | None, pure_decode: bool, devic
     """Agree on accept, fallback, or abort in one group reduction."""
     import torch
     import torch.distributed as dist
-    from cross_rank_prototype.staged_collectives import CollectiveProtocolError
+
+    from vllm_ascend.models.glm5next.mega_kernel_collectives import MegaKernelCollectiveError
 
     status = (
         2
@@ -57,7 +58,7 @@ def coordinate_layer_preflight(error: Exception | None, pure_decode: bool, devic
     result = int(decision.item())
     if result == 2:
         cause = error if not isinstance(error, UnsupportedDecode) else None
-        raise CollectiveProtocolError("model adapter preflight failed on at least one rank; abort job") from cause
+        raise MegaKernelCollectiveError("model adapter preflight failed on at least one rank; abort job") from cause
     return result == 0
 
 
@@ -87,6 +88,25 @@ def _one_dim_slots(tensor: Any, count: int, name: str, torch: Any) -> Any:
     if tensor.ndim != 1 or tensor.numel() != count or tensor.dtype not in (torch.int32, torch.int64):
         raise UnsupportedDecode(f"{name} must be a one-dimensional integer tensor for each request")
     return tensor
+
+
+def _non_overlapping_positive_strides(tensor: Any) -> bool:
+    """Prove that indexed logical elements cannot alias, including across slots.
+
+    This conservative stride-span check accepts transposes and sliced or
+    interleaved pools, while rejecting broadcast and ambiguous overlap. Size-1
+    dimensions do not affect address uniqueness. Storage bounds are enforced
+    by PyTorch when constructing the view.
+    """
+    dimensions = sorted((stride, size) for size, stride in zip(tensor.shape, tensor.stride()) if size > 1)
+    span = 1
+    for stride, size in dimensions:
+        if stride < span:
+            return False
+        # Match the downstream session's conservative stride proof so a
+        # layout rejected there falls back before any collective launch.
+        span = stride * size
+    return True
 
 
 def prepare_decode_inputs(
@@ -205,8 +225,8 @@ def prepare_decode_inputs(
     if not conv_state.is_contiguous() and not transposed_contiguous:
         conv_writeback = conv_state
         conv_state = conv_state.contiguous()
-    if not recurrent_state.is_contiguous():
-        raise UnsupportedDecode("recurrent state layout is not MC2 contiguous")
+    if not _non_overlapping_positive_strides(recurrent_state):
+        raise UnsupportedDecode("recurrent state layout may overlap")
     # One host transfer retains the full signed width of both model slot
     # tensors; converting to the ABI's int32 before validation could wrap.
     slot_pairs = torch.stack((conv_slots.to(torch.int64), recurrent_slots.to(torch.int64)), dim=1)
@@ -392,6 +412,25 @@ def _aligned_mhc_buffers(rows: int, dtype: Any, device: Any, aligned_empty: Call
     return mixing[0], mixing[1]
 
 
+class _MhcBufferCache:
+    """Reuse the last layer-local geometry; callers serialize layer execution."""
+
+    def __init__(self):
+        self.key = None
+        self.buffers = None
+
+    def get(self, rows: int, dtype: Any, device: Any, aligned_empty: Callable[..., Any]) -> tuple[Any, Any]:
+        key = (rows, dtype, device)
+        if key != self.key:
+            self.buffers = _aligned_mhc_buffers(rows, dtype, device, aligned_empty)
+            self.key = key
+        else:
+            # Preserve the previous zero-padding contract on both planes.
+            for value in self.buffers:
+                value.zero_()
+        return self.buffers
+
+
 def _validate_internal_router(layer: Any, router: Any) -> None:
     """Reject model routing features that the MC2 internal router cannot implement."""
     routed = layer.mlp.experts.routed_experts
@@ -443,6 +482,7 @@ class MegaKernelModelBackend:
             raise TypeError("MC2 session and model identity factory are required")
         self.session, self.static_weights, self.attrs = session, dict(static_weights), dict(attrs)
         self.identity_factory = identity_factory
+        self._mhc_buffer_cache = _MhcBufferCache()
 
     def validate(
         self, layer: Any, decode: DecodeInputs, hidden_states: Any, residual: Any, post: Any, comb: Any
@@ -493,14 +533,17 @@ class MegaKernelModelBackend:
         self, layer: Any, positions: Any, hidden_states: Any, residual: Any, post: Any, comb: Any, decode: DecodeInputs
     ) -> tuple[Any, Any, Any, Any]:
         import torch
-        from cross_rank_prototype.staged_collectives import _agree
         from mc2_integration.projection_contract import MC2_INPUT_NAMES
         from mc2_integration.torch_acl_bridge import aligned_empty
+
+        from vllm_ascend.models.glm5next.mega_kernel_collectives import agree_or_abort
 
         rows = decode.rows
         error = None
         try:
-            padded_post, padded_comb = _aligned_mhc_buffers(rows, torch.float32, hidden_states.device, aligned_empty)
+            padded_post, padded_comb = self._mhc_buffer_cache.get(
+                rows, torch.float32, hidden_states.device, aligned_empty
+            )
             if layer.layer_idx == 0 and post is None:
                 # HcPost(identity, zero) reproduces the first layer's hc_expand.
                 model_residual = hidden_states.unsqueeze(1).expand(-1, 4, -1).contiguous()
@@ -532,7 +575,9 @@ class MegaKernelModelBackend:
             identity = self.identity_factory(layer, decode)
         except Exception as exc:
             error = exc
-        _agree(error, self.session.config.control_device, self.session.config.control_group, "model route preparation")
+        agree_or_abort(
+            error, self.session.config.control_device, self.session.config.control_group, "model route preparation"
+        )
         if error is not None:
             raise error
         # The enclosing wrapper validated the query and slots and all ranks
@@ -547,7 +592,7 @@ class MegaKernelModelBackend:
                 torch.npu.current_stream(hidden_states.device).synchronize()
         except Exception as exc:
             error = exc
-        _agree(
+        agree_or_abort(
             error,
             self.session.config.control_device,
             self.session.config.control_group,

@@ -16,7 +16,7 @@ def install(name):
 
 for n in ["cross_rank_prototype", "vllm", "vllm_ascend", "vllm_ascend.models", "vllm_ascend.models.glm5next"]:
     install(n)
-staged = install("cross_rank_prototype.staged_collectives")
+collectives = install("vllm_ascend.models.glm5next.mega_kernel_collectives")
 
 
 def agree(err, dev, group, label):
@@ -24,7 +24,7 @@ def agree(err, dev, group, label):
         raise err
 
 
-staged._agree = agree
+collectives.agree_or_abort = agree
 context = install("vllm.forward_context")
 context.get_forward_context = lambda: N()
 install("vllm.distributed")

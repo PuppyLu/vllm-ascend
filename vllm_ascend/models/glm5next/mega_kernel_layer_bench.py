@@ -33,10 +33,10 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from cross_rank_prototype.staged_collectives import _agree
 from vllm.forward_context import get_forward_context
 
 from vllm_ascend.models.glm5next.mega_kernel_adapter import _copy_live_kda_slots, prepare_decode_inputs
+from vllm_ascend.models.glm5next.mega_kernel_collectives import agree_or_abort as _agree
 
 
 def _clone(value):

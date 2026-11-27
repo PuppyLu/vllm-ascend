@@ -23,7 +23,6 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from cross_rank_prototype.staged_collectives import _agree
 from mc2_integration.stage24_admission import NATIVE_SHARED_PROTOCOL, IndependentIdentity, ReviewedIndependentAbi
 from mc2_integration.torch_acl_bridge import ATTR_NAMES, _check_tensor, aligned_copy
 from mc2_integration.vllm_mc2_bridge import Mc2SessionConfig
@@ -35,6 +34,8 @@ from vllm_ascend.models.glm5next.mega_kernel_adapter import (
     coordinate_layer_preflight,
     validate_model_path_config,
 )
+from vllm_ascend.models.glm5next.mega_kernel_collectives import agree_decode_step
+from vllm_ascend.models.glm5next.mega_kernel_collectives import agree_or_abort as _agree
 from vllm_ascend.models.glm5next.mega_kernel_scheduler import V2SchedulerEvidence
 from vllm_ascend.models.glm5next.mega_kernel_torch_session import create_torch_session
 from vllm_ascend.models.glm5next.mega_kernel_weights import _reuse_or_align_weights, map_static_weights
@@ -253,9 +254,7 @@ def bootstrap(runner: Any, config_path: str):
     sequence = [0]
 
     def agree_step(accepted, step_digest):
-        reports = [None] * world
-        dist.all_gather_object(reports, (accepted, step_digest), group=control)
-        same = all(flag is True and digest == step_digest and digest is not None for flag, digest in reports)
+        same = agree_decode_step(accepted, step_digest, device, control)
         if same:
             if sequence[0] >= 2**31 - 1:
                 raise RuntimeError("MC2 session step counter exhausted; restart the job")

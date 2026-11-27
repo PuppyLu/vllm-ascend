@@ -7,26 +7,21 @@ import datetime
 import importlib.util
 import sys
 import tempfile
-import types
 from pathlib import Path
 
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-
-class CollectiveProtocolError(RuntimeError):
-    pass
-
-
-staged = types.ModuleType("cross_rank_prototype.staged_collectives")
-staged.CollectiveProtocolError = CollectiveProtocolError
-sys.modules["cross_rank_prototype"] = types.ModuleType("cross_rank_prototype")
-sys.modules["cross_rank_prototype.staged_collectives"] = staged
 path = Path(__file__).resolve().parents[3] / "vllm_ascend/models/glm5next/mega_kernel_adapter.py"
 spec = importlib.util.spec_from_file_location("coordination_adapter_cpu_test", path)
 adapter = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = adapter
 spec.loader.exec_module(adapter)
+coord_path = path.with_name("mega_kernel_collectives.py")
+coord_spec = importlib.util.spec_from_file_location("coordination_collectives_cpu_test", coord_path)
+coord = importlib.util.module_from_spec(coord_spec)
+coord_spec.loader.exec_module(coord)
+sys.modules["vllm_ascend.models.glm5next.mega_kernel_collectives"] = coord
 
 
 def run(rank, rendezvous):
@@ -48,10 +43,25 @@ def run(rank, rendezvous):
         for error, pure, expected in cases:
             try:
                 result = adapter.coordinate_layer_preflight(error, pure, "cpu", dist.group.WORLD)
-            except CollectiveProtocolError:
+            except coord.MegaKernelCollectiveError:
                 assert expected == "abort"
             else:
                 assert result is expected
+        step_cases = (
+            (True, "0123456789abcdef" * 4, True),
+            (True, ("0123456789abcdef" if rank == 0 else "fedcba9876543210") * 4, False),
+            (True, "0" * 63 + ("0" if rank == 0 else "1"), False),
+            (rank == 0, "f" * 64, False),
+            (True, "e" * 64 if rank == 0 else None, False),
+            (True, "a" * 64 if rank == 0 else "g" * 64, False),
+            (True, "0" * 64, True),
+            (True, "f" * 64, True),
+        )
+        for accepted, digest, expected in step_cases:
+            result = coord.agree_decode_step(accepted, digest, "cpu", dist.group.WORLD)
+            results = [None, None]
+            dist.all_gather_object(results, result)
+            assert results == [expected, expected], (rank, results, expected)
     finally:
         dist.destroy_process_group()
 

@@ -162,6 +162,28 @@ class DecodeMetadataTests(unittest.TestCase):
             comb.fill_(2)
             self.assertTrue(torch.all(post == 1))
 
+    def test_mhc_buffer_cache_reuses_only_matching_geometry_and_clears_padding(self):
+        allocations = []
+
+        def aligned_empty(shape, dtype, device):
+            allocations.append(shape)
+            element = torch.empty((), dtype=dtype).element_size()
+            count = shape[0] * shape[1] * shape[2]
+            storage = torch.empty(count + 1024 // element, dtype=dtype, device=device)
+            offset = (-storage.data_ptr()) % 512 // element
+            return storage[offset : offset + count].view(shape)
+
+        cache = module._MhcBufferCache()
+        post, comb = cache.get(2, torch.float32, torch.device("cpu"), aligned_empty)
+        post.fill_(1)
+        comb.fill_(2)
+        new_post, new_comb = cache.get(2, torch.float32, torch.device("cpu"), aligned_empty)
+        self.assertEqual((post.data_ptr(), comb.data_ptr()), (new_post.data_ptr(), new_comb.data_ptr()))
+        self.assertEqual(int(new_post.count_nonzero()), 0)
+        self.assertEqual(int(new_comb.count_nonzero()), 0)
+        cache.get(3, torch.float32, torch.device("cpu"), aligned_empty)
+        self.assertEqual(allocations, [(2, 2, 128), (2, 3, 128)])
+
     def test_reject_unproven_prefill_mixed_and_graph(self):
         with self.assertRaises(UnsupportedDecode):
             self.prepare(evidence=False)
@@ -204,6 +226,81 @@ class DecodeMetadataTests(unittest.TestCase):
         torch.testing.assert_close(original[[1, 3]], updated.transpose(-1, -2))
         torch.testing.assert_close(original[[0, 2]], prior[[0, 2]])
 
+    def test_strided_recurrent_state_keeps_interleaved_other_layer_and_inactive_slots(self):
+        # Physical storage has adjacent layer planes per slot, not a dense
+        # pool for one layer. Writes through layer zero must not affect layer one.
+        pool = torch.arange(4 * 2 * 128 * 128, dtype=torch.float32).reshape(4, 2, 1, 128, 128)
+        recurrent = pool[:, 0]
+        before = pool.clone()
+        self.layer.self_attn.kv_cache = (self.layer.self_attn.kv_cache[0], recurrent)
+        decoded = self.prepare()
+        self.assertIs(decoded.recurrent_state, recurrent)
+        self.assertFalse(recurrent.is_contiguous())
+        slots = decoded.state_indices[:, 1].to(torch.int64)
+        staged = recurrent.index_select(0, slots).contiguous()
+        staged.add_(7)
+        # Before publication the model pool is untouched.
+        torch.testing.assert_close(pool, before)
+        recurrent.index_copy_(0, slots, staged)
+        torch.testing.assert_close(pool[:, 1], before[:, 1])
+        torch.testing.assert_close(pool[[1, 3], 0], before[[1, 3], 0])
+        torch.testing.assert_close(pool[[0, 2], 0], before[[0, 2], 0] + 7)
+
+    def test_overlapping_recurrent_view_falls_back_before_any_write(self):
+        source = torch.zeros(1, 1, 128, 128)
+        recurrent = source.expand(4, 1, 128, 128)
+        self.layer.self_attn.kv_cache = (self.layer.self_attn.kv_cache[0], recurrent)
+        with self.assertRaisesRegex(UnsupportedDecode, "may overlap"):
+            self.prepare()
+        self.assertEqual(source.count_nonzero().item(), 0)
+
+    def test_recurrent_stride_proof_accepts_transpose_and_rejects_alias(self):
+        dense = torch.zeros(4, 2, 128, 128)
+        self.assertTrue(module._non_overlapping_positive_strides(dense.transpose(-1, -2)))
+        overlapped = torch.as_strided(dense, (4, 2, 128, 128), (0, 128 * 128, 128, 1))
+        self.assertFalse(module._non_overlapping_positive_strides(overlapped))
+
+    def test_recurrent_stride_proof_matches_session_conservative_padding_rule(self):
+        # The address ranges do not overlap, but the session uses the more
+        # conservative 130*128 lower bound for the next stride.
+        storage = torch.empty(4 * 16640, dtype=torch.float32)
+        recurrent = torch.as_strided(storage, (4, 1, 128, 128), (16638, 16638, 130, 1))
+        self.layer.self_attn.kv_cache = (self.layer.self_attn.kv_cache[0], recurrent)
+        with self.assertRaisesRegex(UnsupportedDecode, "may overlap"):
+            self.prepare()
+
+    def test_mamba_page_components_keep_conv_and_padding_untouched(self):
+        # Reproduce create_cache_component_views: each page stores a BF16
+        # convolution component followed by an FP32 recurrent component.
+        conv_bytes = 3 * 384 * 2
+        rec_bytes = 128 * 128 * 4
+        page_bytes = conv_bytes + rec_bytes + 64
+        raw = torch.full((4 * page_bytes,), 0, dtype=torch.uint8)
+        conv = torch.as_strided(raw.view(torch.bfloat16), (4, 384, 3), (page_bytes // 2, 3, 1))
+        recurrent = torch.as_strided(
+            raw.view(torch.float32),
+            (4, 1, 128, 128),
+            (page_bytes // 4, 128 * 128, 128, 1),
+            storage_offset=conv_bytes // 4,
+        )
+        self.layer.self_attn.kv_cache = (conv, recurrent)
+        self.layer.self_attn._conv_state_dim_first = True
+        decoded = self.prepare()
+        self.assertIs(decoded.recurrent_state, recurrent)
+        self.assertIsNotNone(decoded.conv_writeback)
+        self.assertFalse(recurrent.is_contiguous())
+        slots = decoded.state_indices[:, 1].to(torch.int64)
+        staged = recurrent.index_select(0, slots).contiguous()
+        staged.add_(7)
+        self.assertEqual(raw.count_nonzero().item(), 0)
+        recurrent.index_copy_(0, slots, staged)
+        self.assertEqual(conv.count_nonzero().item(), 0)
+        self.assertEqual(recurrent[[1, 3]].count_nonzero().item(), 0)
+        self.assertTrue(torch.all(recurrent[[0, 2]] == 7))
+        for page in range(4):
+            pad_start = page * page_bytes + conv_bytes + rec_bytes
+            self.assertEqual(raw[pad_start : pad_start + 64].count_nonzero().item(), 0)
+
     def test_noncontiguous_physical_cache_keeps_safe_fallback(self):
         pool = torch.arange(8 * 384 * 3).reshape(8, 384, 3).to(torch.bfloat16)
         original = pool[::2]
@@ -238,7 +335,7 @@ class DecodeMetadataTests(unittest.TestCase):
         projection.MC2_INPUT_NAMES = names
         bridge = ModuleType("mc2_integration.torch_acl_bridge")
         bridge.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
-        collectives = ModuleType("cross_rank_prototype.staged_collectives")
+        collectives = ModuleType("vllm_ascend.models.glm5next.mega_kernel_collectives")
         votes = []
 
         def agree(error, device, group, phase):
@@ -246,11 +343,11 @@ class DecodeMetadataTests(unittest.TestCase):
             if error:
                 raise error
 
-        collectives._agree = agree
+        collectives.agree_or_abort = agree
         modules = {
             "mc2_integration.projection_contract": projection,
             "mc2_integration.torch_acl_bridge": bridge,
-            "cross_rank_prototype.staged_collectives": collectives,
+            "vllm_ascend.models.glm5next.mega_kernel_collectives": collectives,
         }
         syncs = []
         fake_npu = NS(current_stream=lambda device: NS(synchronize=lambda: syncs.append("sync")))
@@ -306,12 +403,12 @@ class DecodeMetadataTests(unittest.TestCase):
         projection.MC2_INPUT_NAMES = names
         bridge = ModuleType("mc2_integration.torch_acl_bridge")
         bridge.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
-        collectives = ModuleType("cross_rank_prototype.staged_collectives")
-        collectives._agree = lambda error, *args: None
+        collectives = ModuleType("vllm_ascend.models.glm5next.mega_kernel_collectives")
+        collectives.agree_or_abort = lambda error, *args: None
         modules = {
             "mc2_integration.projection_contract": projection,
             "mc2_integration.torch_acl_bridge": bridge,
-            "cross_rank_prototype.staged_collectives": collectives,
+            "vllm_ascend.models.glm5next.mega_kernel_collectives": collectives,
         }
         physical = torch.zeros(8, 384, 3, dtype=torch.bfloat16)[::2]
         self.layer.self_attn.kv_cache = (physical, torch.zeros(4, 1, 128, 128))
@@ -394,9 +491,9 @@ class DecodeMetadataTests(unittest.TestCase):
         bridge._check_tensor = lambda *a: None
         bridge.aligned_copy = lambda value: value.clone()
         bridge.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
-        collectives = ModuleType("cross_rank_prototype.staged_collectives")
+        collectives = ModuleType("vllm_ascend.models.glm5next.mega_kernel_collectives")
         votes = []
-        collectives._agree = lambda error, *a: votes.append(a[-1])
+        collectives.agree_or_abort = lambda error, *a: votes.append(a[-1])
         seen = {}
         validated = []
 
@@ -412,7 +509,7 @@ class DecodeMetadataTests(unittest.TestCase):
         modules = {
             "mc2_integration.projection_contract": projection,
             "mc2_integration.torch_acl_bridge": bridge,
-            "cross_rank_prototype.staged_collectives": collectives,
+            "vllm_ascend.models.glm5next.mega_kernel_collectives": collectives,
         }
         with (
             patch.dict(sys.modules, modules),

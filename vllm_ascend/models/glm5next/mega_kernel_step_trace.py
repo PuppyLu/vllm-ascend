@@ -7,6 +7,8 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 
+from vllm_ascend.models.glm5next.mega_kernel_collectives import agree_decode_step
+
 
 def install_decode_step_trace(runner, gate, config, *, group_agreed):
     """Install per-rank timing on real runner steps after model loading.
@@ -35,9 +37,7 @@ def install_decode_step_trace(runner, gate, config, *, group_agreed):
     if not group_agreed:
 
         def agree_step(eligible, digest):
-            reports = [None] * world
-            dist.all_gather_object(reports, (eligible, digest), group=dist.group.WORLD)
-            return all(flag is True and item == digest and item is not None for flag, item in reports)
+            return agree_decode_step(eligible, digest, runner.device, dist.group.WORLD)
 
         gate.set_step_agreement(agree_step)
     hook = V2DecodeStepHook(

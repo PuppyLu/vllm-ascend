@@ -594,25 +594,31 @@ class MegaKernelModelBackend:
         result = self.session.forward(inputs, self.attrs, identity, validated_step=True)
         # Every rank enters the post-commit agreement, even when only some
         # layouts require a separate convolution-state copy.
+        is_final_layer = layer.layer_idx == layer.num_hidden_layers - 1
         error = None
         try:
             if decode.conv_writeback is not None:
                 decode.conv_writeback.copy_(decode.conv_state)
                 torch.npu.current_stream(hidden_states.device).synchronize()
+            if is_final_layer:
+                from vllm_ascend.models.glm5next.ops.mhc_ops import hc_contract
+
+                output, ffn_residual, ffn_post, ffn_comb = result
+                output = hc_contract(layer.hc_post(output, ffn_residual, ffn_post, ffn_comb), layer.n)
+                # A local asynchronous failure here must be visible before the
+                # final all-rank decision, not after peers reach logits/HCCL.
+                torch.npu.current_stream(hidden_states.device).synchronize()
+                result = (output, None, None, None)
         except Exception as exc:
             error = exc
         agree_or_abort(
             error,
             self.session.config.control_device,
             self.session.config.control_group,
-            "model convolution state writeback",
+            "model convolution state writeback and final output"
+            if is_final_layer
+            else "model convolution state writeback",
         )
         if error is not None:
             raise error
-        if layer.layer_idx == layer.num_hidden_layers - 1:
-            from vllm_ascend.models.glm5next.ops.mhc_ops import hc_contract
-
-            output, ffn_residual, ffn_post, ffn_comb = result
-            output = hc_contract(layer.hc_post(output, ffn_residual, ffn_post, ffn_comb), layer.n)
-            return output, None, None, None
         return result

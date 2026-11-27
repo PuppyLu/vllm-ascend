@@ -8,9 +8,10 @@ import importlib.util
 import sys
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
+import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -30,6 +31,90 @@ sched_spec = importlib.util.spec_from_file_location(
 scheduler = importlib.util.module_from_spec(sched_spec)
 sys.modules[sched_spec.name] = scheduler
 sched_spec.loader.exec_module(scheduler)
+
+
+def check_final_output_coordination(rank, world_size):
+    """Non-output-rank final mHC errors must stop every rank before logits."""
+    abi_name = "vllm_ascend.models.glm5next.mega_kernel_abi"
+    mhc_name = "vllm_ascend.models.glm5next.ops.mhc_ops"
+    abi = ModuleType(abi_name)
+    abi.MC2_INPUT_NAMES = (
+        "x",
+        "post_h_res",
+        "post_h_out",
+        "post_h_post",
+        "conv_state",
+        "recurrent_state",
+        "cu_seqlens",
+        "state_indices",
+    )
+    abi.aligned_empty = lambda shape, dtype, device: torch.empty(shape, dtype=dtype, device=device)
+    mhc = ModuleType(mhc_name)
+    sys.modules[abi_name] = abi
+    sys.modules[mhc_name] = mhc
+    old_npu = getattr(torch, "npu", None)
+    state = {"mode": "none", "syncs": 0}
+
+    def synchronize():
+        state["syncs"] += 1
+        if state["mode"] == "sync" and rank == 1:
+            raise RuntimeError("injected final stream failure")
+
+    def contract(value, n):
+        if state["mode"] == "contract" and rank == 1:
+            raise RuntimeError("injected final contract failure")
+        return value * n
+
+    mhc.hc_contract = contract
+    torch.npu = SimpleNamespace(current_stream=lambda device: SimpleNamespace(synchronize=synchronize))
+    session = SimpleNamespace(
+        config=SimpleNamespace(control_device="cpu", control_group=dist.group.WORLD),
+        forward=lambda *a, **k: (torch.ones(1, 2), torch.zeros(1, 4, 2), torch.zeros(1, 4, 1), torch.zeros(1, 4, 4)),
+    )
+    backend = adapter.MegaKernelModelBackend(session, {}, {}, lambda *a: None)
+    decode = SimpleNamespace(
+        rows=1,
+        conv_state=torch.zeros(1),
+        conv_writeback=None,
+        recurrent_state=torch.zeros(1),
+        cu_seqlens=torch.zeros(1),
+        state_indices=torch.zeros(1),
+    )
+    args = (torch.ones(1, 2), torch.zeros(1, 4, 2), torch.zeros(1, 4, 1), torch.zeros(1, 4, 4), decode)
+    try:
+        for mode in ("none", "post", "contract", "sync"):
+            state["mode"] = mode
+
+            def hc_post(output, *unused):
+                if state["mode"] == "post" and rank == 1:
+                    raise RuntimeError("injected final mHC failure")
+                return output + 2
+
+            layer = SimpleNamespace(layer_idx=1, num_hidden_layers=2, n=4, hc_post=hc_post)
+            result, failed = None, False
+            try:
+                result = backend(layer, None, *args)
+            except coord.MegaKernelCollectiveError:
+                failed = True
+            outcomes = [None] * world_size
+            dist.all_gather_object(outcomes, failed)
+            assert outcomes == [mode != "none"] * world_size, (rank, mode, outcomes)
+            if mode == "none":
+                torch.testing.assert_close(result[0], torch.full((1, 2), 12.0))
+                assert result[1:] == (None, None, None)
+        # A middle layer retains its deferred mHC tuple and does not add a
+        # final-output stream synchronization.
+        state["mode"] = "none"
+        prior_syncs = state["syncs"]
+        layer = SimpleNamespace(layer_idx=1, num_hidden_layers=3, n=4, hc_post=lambda *a: None)
+        result = backend(layer, None, *args)
+        torch.testing.assert_close(result[0], torch.ones(1, 2))
+        assert state["syncs"] == prior_syncs
+    finally:
+        if old_npu is None:
+            del torch.npu
+        else:
+            torch.npu = old_npu
 
 
 def run(rank, rendezvous, world_size):
@@ -161,6 +246,17 @@ def run(rank, rendezvous, world_size):
                 raise AssertionError("all ranks must abort on one rank's capture guard failure")
         finally:
             gate.uninstall()
+        # Older MC2 sessions always expose actual route snapshots and do not
+        # implement a switch. Diagnostic capture must not invent one.
+        legacy_session = SimpleNamespace(last_route_ids=None, last_route_weights=None)
+        assert coord.enable_diagnostic_route_capture(legacy_session) is None
+        assert not hasattr(legacy_session, "capture_routes")
+        for previous in (False, True):
+            current = SimpleNamespace(capture_routes=previous)
+            prior = coord.enable_diagnostic_route_capture(current)
+            assert prior is previous and current.capture_routes is True
+            current.capture_routes = prior
+            assert current.capture_routes is previous
         # A missing route-capture API on one rank must abort all participants
         # at preparation, before any peer can launch the fused collective.
         session = SimpleNamespace(capture_routes=False) if rank != 1 else SimpleNamespace()
@@ -186,6 +282,7 @@ def run(rank, rendezvous, world_size):
         assert results == [False] * world_size, (rank, results)
         if rank != 1:
             assert session.capture_routes is False
+        check_final_output_coordination(rank, world_size)
     finally:
         dist.destroy_process_group()
 

@@ -110,6 +110,17 @@ class DecodeMetadataTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_ordered_rpc_simulation_for_successive_requests(self):
+        worker = Path(__file__).with_name("mega_kernel_rpc_gloo_worker.py")
+        result = subprocess.run(
+            [sys.executable, str(worker)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=90,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_real_slot_columns_and_single_token_template(self):
         result = self.prepare()
         torch.testing.assert_close(result.state_indices, torch.tensor([[1, 2], [3, 0]], dtype=torch.int32))

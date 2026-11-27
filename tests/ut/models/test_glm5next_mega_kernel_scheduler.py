@@ -108,7 +108,7 @@ class SchedulerTests(unittest.TestCase):
 
         gate = module.V2SchedulerEvidence(Runner, capture_guard=lambda: True)
         votes = []
-        gate.set_step_agreement(lambda accepted, digest: votes.append(accepted) or accepted)
+        gate.set_step_agreement(lambda accepted, digest, error: votes.append(accepted) or accepted)
         gate.install()
         try:
             runner = Runner()

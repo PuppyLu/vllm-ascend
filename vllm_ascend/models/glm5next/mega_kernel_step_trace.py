@@ -37,8 +37,8 @@ def install_decode_step_trace(runner, gate, config, *, group_agreed):
         raise ValueError("Decode step matching currently requires PP1 and same ordered TP/EP world")
     if not group_agreed:
 
-        def agree_step(eligible, digest):
-            return agree_decode_step(eligible, digest, runner.device, dist.group.WORLD)
+        def agree_step(eligible, digest, local_error):
+            return agree_decode_step(eligible, digest, runner.device, dist.group.WORLD, local_error=local_error)
 
         gate.set_step_agreement(agree_step)
     hook = V2DecodeStepHook(

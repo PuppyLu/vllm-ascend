@@ -254,8 +254,8 @@ def bootstrap(runner: Any, config_path: str):
     # advances only after this all-rank agreement, so it is not a local guess.
     sequence = [0]
 
-    def agree_step(accepted, step_digest):
-        same = agree_decode_step(accepted, step_digest, device, control)
+    def agree_step(accepted, step_digest, local_error):
+        same = agree_decode_step(accepted, step_digest, device, control, local_error=local_error)
         if same:
             if sequence[0] >= 2**31 - 1:
                 raise RuntimeError("MC2 session step counter exhausted; restart the job")

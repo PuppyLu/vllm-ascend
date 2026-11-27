@@ -10,6 +10,7 @@ import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
@@ -23,6 +24,12 @@ coord_spec = importlib.util.spec_from_file_location("coordination_collectives_cp
 coord = importlib.util.module_from_spec(coord_spec)
 coord_spec.loader.exec_module(coord)
 sys.modules["vllm_ascend.models.glm5next.mega_kernel_collectives"] = coord
+sched_spec = importlib.util.spec_from_file_location(
+    "coordination_scheduler_cpu_test", path.with_name("mega_kernel_scheduler.py")
+)
+scheduler = importlib.util.module_from_spec(sched_spec)
+sys.modules[sched_spec.name] = scheduler
+sched_spec.loader.exec_module(scheduler)
 
 
 def run(rank, rendezvous, world_size):
@@ -63,6 +70,97 @@ def run(rank, rendezvous, world_size):
             results = [None] * world_size
             dist.all_gather_object(results, result)
             assert results == [expected] * world_size, (rank, results, expected)
+        # Real rank collectives around successive model requests: an eligible
+        # decode, a group fallback when one rank observes prefill, and another
+        # request must all leave the gate reusable. An actual prepare failure
+        # on one rank must abort peers instead of stranding them in the vote.
+        ids = ["req-a", "req-b"]
+        req = SimpleNamespace(
+            req_ids=ids,
+            num_scheduled_tokens=np.array([1, 1]),
+            is_prefilling_np=np.zeros(2, dtype=bool),
+            prefill_runs_as_decode_np=None,
+            prefill_len_np=np.array([5, 7]),
+            num_computed_prefill_tokens_np=np.array([5, 7]),
+        )
+        batch = SimpleNamespace(
+            req_ids=ids,
+            is_dummy=False,
+            num_reqs=2,
+            num_tokens=2,
+            num_tokens_after_padding=2,
+            num_draft_tokens=0,
+            num_computed_tokens_np=np.array([9, 12]),
+        )
+        desc = SimpleNamespace(cg_mode=SimpleNamespace(name="NONE"))
+        output = SimpleNamespace(num_scheduled_tokens=dict.fromkeys(ids, 1), scheduled_spec_decode_tokens={})
+
+        class Runner:
+            pcp_manager = None
+            vllm_config = SimpleNamespace(
+                model_config=SimpleNamespace(enforce_eager=True),
+                compilation_config=SimpleNamespace(cudagraph_mode=SimpleNamespace(name="NONE")),
+            )
+
+            def prepare_inputs(self, scheduler_output, batch_req_state, batch_desc):
+                if self.inject_error:
+                    raise RuntimeError("injected prepare error")
+                return batch
+
+            def execute_model(self, scheduler_output, dummy_run=False, is_profile=False):
+                self.prepare_inputs(scheduler_output, req, desc)
+                return gate.is_pure_decode()
+
+        gate = scheduler.V2SchedulerEvidence(Runner, capture_guard=lambda: True)
+        gate.set_step_agreement(
+            lambda accepted, digest, error: coord.agree_decode_step(
+                accepted, digest, "cpu", dist.group.WORLD, local_error=error
+            )
+        )
+        gate.install()
+        runner = Runner()
+        runner.inject_error = False
+        try:
+            assert runner.execute_model(output)
+            assert not gate.is_pure_decode()
+            req.is_prefilling_np[0] = rank == 1
+            assert not runner.execute_model(output)
+            # Finish the first batch and admit a different request set and
+            # geometry, as happens when a subsequent user request arrives.
+            next_ids = ["req-c", "req-d", "req-e"]
+            req.req_ids = next_ids
+            req.num_scheduled_tokens = np.ones(3, dtype=np.int64)
+            req.is_prefilling_np = np.zeros(3, dtype=bool)
+            req.prefill_len_np = np.array([2, 4, 6])
+            req.num_computed_prefill_tokens_np = np.array([2, 4, 6])
+            batch.req_ids = next_ids
+            batch.num_reqs = batch.num_tokens = batch.num_tokens_after_padding = 3
+            batch.num_computed_tokens_np = np.array([3, 5, 7])
+            output.num_scheduled_tokens = dict.fromkeys(next_ids, 1)
+            assert runner.execute_model(output)
+            runner.inject_error = rank == 1
+            try:
+                runner.execute_model(output)
+            except coord.MegaKernelCollectiveError:
+                pass
+            else:
+                raise AssertionError("all ranks must abort on one rank's prepare failure")
+            runner.inject_error = False
+
+            def capture_guard():
+                if rank == 1:
+                    raise RuntimeError("injected capture guard failure")
+                return True
+
+            gate.capture_guard = capture_guard
+            try:
+                runner.execute_model(output)
+            except coord.MegaKernelCollectiveError:
+                pass
+            else:
+                raise AssertionError("all ranks must abort on one rank's capture guard failure")
+        finally:
+            gate.uninstall()
         # A missing route-capture API on one rank must abort all participants
         # at preparation, before any peer can launch the fused collective.
         session = SimpleNamespace(capture_routes=False) if rank != 1 else SimpleNamespace()

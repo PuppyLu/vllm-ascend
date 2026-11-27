@@ -162,7 +162,7 @@ class V2SchedulerEvidence:
         self._step_agreement = None
         self._execute_lock = threading.Lock()
 
-    def set_step_agreement(self, agreement: Callable[[bool, str | None], bool]) -> None:
+    def set_step_agreement(self, agreement: Callable[[bool, str | None, Exception | None], bool]) -> None:
         if self._step_agreement is not None or not callable(agreement):
             raise RuntimeError("a single group-wide step agreement is required")
         self._step_agreement = agreement
@@ -239,9 +239,6 @@ class V2SchedulerEvidence:
 
         @functools.wraps(prepare)
         def prepare_inputs(runner: Any, *args: Any, **kwargs: Any):
-            bound = prepare_sig.bind(runner, *args, **kwargs)
-            bound.apply_defaults()
-            batch = prepare(runner, *args, **kwargs)
             frame = _frame.get()
             if (
                 not isinstance(frame, _Frame)
@@ -249,39 +246,54 @@ class V2SchedulerEvidence:
                 or frame.runner is not runner
                 or frame.thread_id != threading.get_ident()
             ):
-                return batch
+                return prepare(runner, *args, **kwargs)
             frame.prepare_calls += 1
             frame.pure = False
             if not frame.permitted_execute:
                 frame.reason = "dummy or profile"
-                return batch
-            if frame.prepare_calls != 1:
-                raise RuntimeError("multiple prepare calls in one execution are unsupported")
-            if bound.arguments["scheduler_output"] is not frame.scheduler_output:
-                frame.reason = "scheduler object changed"
-            else:
+                return prepare(runner, *args, **kwargs)
+            local_error = None
+            batch = None
+            try:
+                bound = prepare_sig.bind(runner, *args, **kwargs)
+                bound.apply_defaults()
+                batch = prepare(runner, *args, **kwargs)
+                if frame.prepare_calls != 1:
+                    raise RuntimeError("multiple prepare calls in one execution are unsupported")
+            except Exception as exc:
+                local_error = exc
+                frame.reason = "step_preparation_failed"
+            if local_error is None:
                 try:
-                    frame.logical_step_id = _classify(
-                        runner,
-                        frame.scheduler_output,
-                        bound.arguments["batch_req_state"],
-                        bound.arguments["batch_desc"],
-                        batch,
-                    )
-                    frame.pure = gate.capture_guard() is True
-                    frame.reason = "pure_decode" if frame.pure else "capture_guard_failed"
+                    if bound.arguments["scheduler_output"] is not frame.scheduler_output:
+                        frame.reason = "scheduler object changed"
+                    else:
+                        frame.logical_step_id = _classify(
+                            runner,
+                            frame.scheduler_output,
+                            bound.arguments["batch_req_state"],
+                            bound.arguments["batch_desc"],
+                            batch,
+                        )
+                        frame.pure = gate.capture_guard() is True
+                        frame.reason = "pure_decode" if frame.pure else "capture_guard_failed"
                 except EvidenceUnavailable as exc:
                     frame.reason = str(exc)
+                except Exception as exc:
+                    local_error = exc
+                    frame.reason = "step_preparation_failed"
             if gate._step_agreement is not None:
                 # All ranks must execute the same ordinary model step here.
                 # Dummy/profile runs never enter this collective. A transport
                 # failure must be handled by the distributed job watchdog.
-                accepted = gate._step_agreement(frame.pure, frame.logical_step_id)
+                accepted = gate._step_agreement(frame.pure, frame.logical_step_id, local_error)
                 if type(accepted) is not bool:
                     raise RuntimeError("step agreement did not return a boolean")
                 frame.pure = frame.pure and accepted
                 if not accepted:
                     frame.reason = "group_decode_contract_not_met"
+            if local_error is not None:
+                raise local_error
             return batch
 
         self._originals = {"execute_model": execute, "prepare_inputs": prepare}

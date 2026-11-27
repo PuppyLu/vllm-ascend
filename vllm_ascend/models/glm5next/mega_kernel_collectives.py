@@ -32,7 +32,7 @@ def agree_or_abort(local_error, device, group, phase):
         ) from local_error
 
 
-def agree_decode_step(accepted, digest, device, group):
+def agree_decode_step(accepted, digest, device, group, *, local_error=None):
     """Agree eligibility and the complete ordered-step digest with one reduction.
 
     Hash words are 16-bit values stored in int32, so both signs are safe for
@@ -47,7 +47,14 @@ def agree_decode_step(accepted, digest, device, group):
         and all(character in "0123456789abcdef" for character in digest)
     )
     words = [int(digest[i : i + 4], 16) for i in range(0, 64, 4)] if valid else [0] * _DIGEST_WORDS
-    values = torch.tensor([int(not valid), *words, *(-word for word in words)], dtype=torch.int32, device=device)
+    # An unexpected local preparation failure must abort the whole group,
+    # rather than turn into an ordinary unsupported-batch fallback on peers.
+    status = 2 if local_error is not None else int(not valid)
+    values = torch.tensor([status, *words, *(-word for word in words)], dtype=torch.int32, device=device)
     dist.all_reduce(values, op=dist.ReduceOp.MAX, group=group)
     reduced = values.cpu().tolist()
+    if reduced[0] == 2:
+        raise MegaKernelCollectiveError(
+            "model step preparation failed on at least one rank; abort job"
+        ) from local_error
     return reduced[0] == 0 and all(reduced[1 + i] == -reduced[1 + _DIGEST_WORDS + i] for i in range(_DIGEST_WORDS))

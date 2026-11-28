@@ -7,7 +7,7 @@ Only loaded weights are mapped here; per-step inputs, live states, routes,
 communication groups, MC2 invocation, graph lifetime and refit invalidation
 are the integrator's responsibility. This code has NOT been tested on A3.
 Call only after vLLM's process_weights_after_loading; expert matrices share
-the original contiguous ND [E,K,N] or INT8 NZ [E,K,N] storage directly.
+the original contiguous ND [E,K,N] or BF16/INT8 NZ [E,K,N] storage directly.
 Neither form copies an expert bank.
 """
 
@@ -64,7 +64,7 @@ def _expert_format(value):
 
 
 def _native_expert_weight(obj, name, native_shape, dtype):
-    """Borrow contiguous ND or INT8 NZ native [E,K,N] storage directly.
+    """Borrow contiguous ND or BF16/INT8 NZ native [E,K,N] storage directly.
 
     Prefill keeps using the original tensor. Never cast or materialize an
     expert bank: either operation duplicates its entire storage.
@@ -75,7 +75,7 @@ def _native_expert_weight(obj, name, native_shape, dtype):
         raise WeightContractError(
             f"{name}: expected {dtype} native {tuple(native_shape)}, got {value.dtype} {tuple(value.shape)}"
         )
-    if fmt not in (0, 2, 29) or (fmt == 29 and dtype != torch.int8):
+    if fmt not in (0, 2, 29) or (fmt == 29 and dtype not in (torch.int8, torch.bfloat16)):
         raise WeightContractError(f"{name}: unsupported expert storage format {fmt}")
     if not value.is_contiguous():
         raise WeightContractError(f"{name}: native [E,K,N] expert storage must be contiguous")
@@ -84,13 +84,13 @@ def _native_expert_weight(obj, name, native_shape, dtype):
 
 
 def _validate_native_expert(value):
-    """Validate a contiguous [E,K,N] ND or INT8 NZ expert bank."""
+    """Validate a contiguous [E,K,N] ND or BF16/INT8 NZ expert bank."""
     if not isinstance(value, torch.Tensor) or value.ndim != 3:
         raise WeightContractError("expert bank must be a three-dimensional tensor")
     fmt = _expert_format(value)
     if fmt == 29:
-        if value.dtype != torch.int8 or not value.is_contiguous():
-            raise WeightContractError("FRACTAL_NZ expert bank must be contiguous INT8")
+        if value.dtype not in (torch.int8, torch.bfloat16) or not value.is_contiguous():
+            raise WeightContractError("FRACTAL_NZ expert bank must be contiguous BF16 or INT8")
         return value
     if fmt not in (0, 2):
         raise WeightContractError(f"unsupported expert storage format {fmt}")
@@ -103,7 +103,7 @@ def _expert_weight_pair(expert, up_shape, down_shape, dtype):
     up = _native_expert_weight(expert, "w13_weight", up_shape, dtype)
     down = _native_expert_weight(expert, "w2_weight", down_shape, dtype)
     if (_expert_format(up) == 29) != (_expert_format(down) == 29):
-        raise WeightContractError("routed expert banks must both be ND or both be INT8 FRACTAL_NZ")
+        raise WeightContractError("routed expert banks must both be ND or both be FRACTAL_NZ")
     return up, down
 
 
@@ -294,7 +294,7 @@ def map_static_weights(layer, *, ep_rank, ep_world, allow_nz=False, expert_postp
         routed_down_scale = _scale(expert, "w2_weight_scale", (hi - lo, 4096), allow_nz=allow_nz)
     else:
         raise WeightContractError("routed expert type is not verified BF16 or W8A8_DYNAMIC")
-    # vLLM post-load: checkpoint [E,N,K] -> native [E,K,N], ND or INT8 NZ.
+    # vLLM post-load: checkpoint [E,N,K] -> native [E,K,N], ND or BF16/INT8 NZ.
     # Both layouts are passed in their native shape with contiguous strides.
     # Never convert whole expert banks. Keep original weights for prefill.
     w13, w2 = _expert_weight_pair(expert, (hi - lo, 4096, 4096), (hi - lo, 2048, 4096), expert_dtype)

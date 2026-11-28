@@ -50,28 +50,29 @@ class WeightTests(unittest.TestCase):
     def test_nz_pair_is_borrowed_with_native_shape_and_no_copy(self):
         # Mock only the format query: physical NZ storage is validated by the
         # Torch C++ entry and needs real NPU tests, not these CPU tensors.
-        up = torch.arange(32, dtype=torch.int8).reshape(2, 4, 4)
-        down = torch.arange(24, dtype=torch.int8).reshape(2, 3, 4)
-        expert = SimpleNamespace(w13_weight=up, w2_weight=down)
-        copy = unittest.mock.Mock(side_effect=AssertionError("must not copy expert weight"))
-        with patch.object(module, "_expert_format", return_value=29):
-            mapped_up, mapped_down = module._expert_weight_pair(expert, up.shape, down.shape, torch.int8)
-            self.assertEqual(mapped_up.data_ptr(), up.data_ptr())
-            self.assertEqual(mapped_down.data_ptr(), down.data_ptr())
-            self.assertEqual(tuple(mapped_down.shape), tuple(down.shape))
-            self.assertEqual(tuple(mapped_down.stride()), tuple(down.stride()))
-            self.assertIs(module._validate_native_expert(mapped_down), mapped_down)
-            mapped = module._reuse_or_align_weights(
-                {"batch_expert_weight": mapped_up, "batch_expert_down_weight": mapped_down},
-                "cpu",
-                lambda value, device, **kwargs: None,
-                copy,
-            )
-        self.assertEqual(mapped["batch_expert_weight"].data_ptr(), up.data_ptr())
-        self.assertEqual(mapped["batch_expert_down_weight"].data_ptr(), down.data_ptr())
-        copy.assert_not_called()
+        for dtype in (torch.int8, torch.bfloat16):
+            up = torch.arange(32, dtype=dtype).reshape(2, 4, 4)
+            down = torch.arange(24, dtype=dtype).reshape(2, 3, 4)
+            expert = SimpleNamespace(w13_weight=up, w2_weight=down)
+            copy = unittest.mock.Mock(side_effect=AssertionError("must not copy expert weight"))
+            with patch.object(module, "_expert_format", return_value=29):
+                mapped_up, mapped_down = module._expert_weight_pair(expert, up.shape, down.shape, dtype)
+                self.assertEqual(mapped_up.data_ptr(), up.data_ptr())
+                self.assertEqual(mapped_down.data_ptr(), down.data_ptr())
+                self.assertEqual(tuple(mapped_down.shape), tuple(down.shape))
+                self.assertEqual(tuple(mapped_down.stride()), tuple(down.stride()))
+                self.assertIs(module._validate_native_expert(mapped_down), mapped_down)
+                mapped = module._reuse_or_align_weights(
+                    {"batch_expert_weight": mapped_up, "batch_expert_down_weight": mapped_down},
+                    "cpu",
+                    lambda value, device, **kwargs: None,
+                    copy,
+                )
+            self.assertEqual(mapped["batch_expert_weight"].data_ptr(), up.data_ptr())
+            self.assertEqual(mapped["batch_expert_down_weight"].data_ptr(), down.data_ptr())
+            copy.assert_not_called()
 
-    def test_expert_pair_rejects_mixed_formats_and_non_int8_nz(self):
+    def test_expert_pair_rejects_mixed_formats_and_unsupported_nz_dtype(self):
         up = torch.zeros((2, 4, 4), dtype=torch.int8)
         down = torch.zeros((2, 3, 4), dtype=torch.int8)
         expert = SimpleNamespace(w13_weight=up, w2_weight=down)
@@ -82,12 +83,12 @@ class WeightTests(unittest.TestCase):
             self.assertRaisesRegex(module.WeightContractError, "both be ND or both be"),
         ):
             module._expert_weight_pair(expert, up.shape, down.shape, torch.int8)
-        bf16 = torch.zeros((2, 3, 4), dtype=torch.bfloat16)
+        invalid = torch.zeros((2, 3, 4), dtype=torch.float32)
         with (
             patch.object(module, "_expert_format", return_value=29),
             self.assertRaisesRegex(module.WeightContractError, "unsupported expert storage format"),
         ):
-            module._native_expert_weight(SimpleNamespace(weight=bf16), "weight", bf16.shape, torch.bfloat16)
+            module._native_expert_weight(SimpleNamespace(weight=invalid), "weight", invalid.shape, torch.float32)
         with (
             patch.object(module, "_expert_format", return_value=30),
             self.assertRaisesRegex(module.WeightContractError, "unsupported expert storage format"),

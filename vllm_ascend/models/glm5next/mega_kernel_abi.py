@@ -7,14 +7,14 @@ The order must match the generated ACLNN header and the Torch extension.
 Aligned allocations include the tail required by the extension's DMA checks.
 """
 
-from dataclasses import dataclass
 import hashlib
 import json
 import math
 import operator
-import re
+from dataclasses import dataclass
 from typing import Any
 
+import regex as re
 import torch
 
 MC2_INPUT_NAMES = (
@@ -181,9 +181,9 @@ def validate_expert_bank(inputs, rank, world, layout, *, shared_width=2048):
     up = inputs["batch_expert_weight"]
     down = inputs["batch_expert_down_weight"]
     nz_up, nz_down = _is_nz(up), _is_nz(down)
-    if nz_up != nz_down or (nz_up and first.dtype != torch.int8):
-        raise ValueError("routed expert weights require paired INT8 FRACTAL_NZ or paired ND")
     native = tuple(down.shape) == (count, _ROUTED_INTERMEDIATE, _MODEL_HIDDEN)
+    if nz_up != nz_down or (nz_up and not native):
+        raise ValueError("routed expert weights require paired native [E,K,N] FRACTAL_NZ or paired ND")
     down_shape = (
         (count, _ROUTED_INTERMEDIATE, _MODEL_HIDDEN) if native else (count, _MODEL_HIDDEN, _ROUTED_INTERMEDIATE)
     )
@@ -406,9 +406,7 @@ class ReviewedAbi:
     output_count: int
 
     def validate(self) -> None:
-        if not isinstance(self.generated_header_sha256, str) or not _HEX256_RE.fullmatch(
-            self.generated_header_sha256
-        ):
+        if not isinstance(self.generated_header_sha256, str) or not _HEX256_RE.fullmatch(self.generated_header_sha256):
             raise ValueError("invalid reviewed generated header SHA256")
         if (
             self.protocol not in PROTOCOL_STAGE_MAP
@@ -544,7 +542,7 @@ def check_abi_tensor(value: Any, device: Any, *, allow_expert_view: bool = False
         if fmt not in (0, 2) and not (
             fmt == 29
             and allow_expert_view
-            and value.dtype == torch.int8
+            and value.dtype in (torch.int8, torch.bfloat16)
             and value.ndim == 3
             and value.shape[1] in (2048, 4096)
             and value.shape[2] == 4096
@@ -658,8 +656,7 @@ def tensor_sha256(named_tensors) -> bytes:
     def iter_chunks(val: torch.Tensor, elem_limit: int):
         if is_fractal_nz(val):
             if val.ndim == 3:
-                for expert in val.unbind(0):
-                    yield expert
+                yield from val.unbind(0)
             else:
                 yield val
             return
@@ -694,10 +691,14 @@ def expert_bank_digest(inputs: dict[str, Any]) -> str:
     val = inputs.get("batch_expert_weight")
     if not isinstance(val, torch.Tensor) or val.dtype not in (torch.int8, torch.bfloat16):
         raise ValueError("invalid expert bank dtype")
-    fields = ("batch_expert_weight", "batch_expert_down_weight") if val.dtype == torch.bfloat16 else (
-        "batch_expert_weight",
-        "batch_expert_channel_scale",
-        "batch_expert_down_weight",
-        "batch_expert_down_channel_scale",
+    fields = (
+        ("batch_expert_weight", "batch_expert_down_weight")
+        if val.dtype == torch.bfloat16
+        else (
+            "batch_expert_weight",
+            "batch_expert_channel_scale",
+            "batch_expert_down_weight",
+            "batch_expert_down_channel_scale",
+        )
     )
     return tensor_sha256((name, _expert_hash_view(inputs, name)) for name in fields).hex()
